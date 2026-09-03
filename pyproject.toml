@@ -1,0 +1,26 @@
+[project]
+name = "rodent-identification"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "gtts>=2.5.4",
+    "httpx>=0.28.1",
+    "mss>=10.2.0",
+    "opencv-python-headless>=5.0.0.93",
+    "pillow>=12.3.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "python-multipart>=0.0.32",
+    "pyyaml>=6.0.3",
+    "ring-doorbell>=0.9.14",
+    "uvicorn>=0.52.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -12,6 +12,8 @@ env/
 node_modules/
 dist/
 build/
+.gradle/
+*/.gradle/
 
 # Data & Models
 data/*
@@ -24,3 +26,17 @@ models/*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Secrets & Private Credentials
+ring_token.json
+config.yaml
+certs/
+*.pem
+*.key
+*.log
+
+# Scratch & temporary artifacts
+scratch/
+debug_snap.jpg
+test_masked_zone.jpg
+benchmark_results.json

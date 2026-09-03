@@ -1,0 +1,22 @@
+[Unit]
+Description=RatWatch DGX Spark FastAPI Sighting Validator
+After=network.target vllm.service
+Wants=vllm.service
+
+[Service]
+Type=simple
+User=dgxuser
+WorkingDirectory=/home/dgxuser/ratwatch/spark
+Environment="VLLM_URL=http://127.0.0.1:8000/v1"
+Environment="VLLM_MODEL=gemma4-26b"
+Environment="WATCH_URL=http://watch.local:8099/alert"
+Environment="PHONE_BRIDGE_URL=http://s21.local:8098/bridge-alert"
+Environment="CONFIRM_MIN=0.55"
+Environment="VISION_TOKENS=280"
+Environment="THINKING=off"
+ExecStart=/home/dgxuser/ratwatch/.venv/bin/uvicorn ratwatch_api:app --host 0.0.0.0 --port 8088
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-slate-950 text-slate-100">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>RodentWatch AI — S21 Ultra Live Cam</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { touch-action: manipulation; }
+    #videoPreview { object-fit: cover; }
+  </style>
+</head>
+<body class="h-full flex flex-col justify-between p-4 bg-slate-950 select-none">
+
+  <!-- Header -->
+  <header class="flex items-center justify-between bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl backdrop-blur">
+    <div class="flex items-center gap-2.5">
+      <span class="text-xl">📱</span>
+      <div>
+        <h1 class="text-sm font-bold text-white leading-none">Samsung S21 Ultra Cam</h1>
+        <p class="text-[11px] text-slate-400 mt-0.5" id="headerSubtitle">Streaming to Gemma 4 12B Vision</p>
+      </div>
+    </div>
+    
+    <div class="flex items-center gap-2">
+      <!-- Mobile Target Selector -->
+      <select id="mobileTargetSelect" class="bg-slate-950 text-amber-300 text-xs font-bold border border-slate-700 rounded-lg px-2.5 py-1 focus:border-amber-500 focus:outline-none">
+        <option value="all">🌐 All</option>
+        <option value="rat">🐀 Rat</option>
+        <option value="bird">🐦 Bird</option>
+        <option value="tree">🌲 Tree</option>
+        <option value="horse">🐴 Horse</option>
+        <option value="horses_poo">🐴💩 Horses poo</option>
+      </select>
+
+      <span id="streamStatusBadge" class="text-xs bg-slate-800 text-slate-400 px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5">
+        <span class="w-2 h-2 rounded-full bg-slate-500"></span> Standby
+      </span>
+    </div>
+  </header>
+
+  <!-- Video Preview Canvas -->
+  <main class="relative flex-1 my-3 bg-black rounded-2xl border border-slate-800 overflow-hidden flex items-center justify-center">
+    <video id="videoPreview" autoplay playsinline muted class="w-full h-full object-cover scale-y-[1.40] origin-center"></video>
+    
+    <!-- Motion Alert Overlay -->
+    <div id="motionAlert" class="hidden absolute top-4 right-4 bg-red-600/90 text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-lg animate-pulse flex items-center gap-1.5">
+      <span id="motionAlertIcon">🚨</span> <span id="motionAlertText">Scanning Movement...</span>
+    </div>
+
+    <!-- Error Banner Overlay -->
+    <div id="errorBanner" class="hidden absolute inset-4 bg-red-950/90 border border-red-800 rounded-xl p-4 text-xs text-red-200 flex flex-col items-center justify-center text-center gap-2 z-30">
+      <span class="text-2xl">⚠️</span>
+      <span id="errorMessage" class="font-semibold">Camera Error</span>
+      <p class="text-[11px] text-red-300">Please make sure camera permissions are allowed in your browser settings.</p>
+    </div>
+
+    <!-- Live Telemetry Overlays -->
+    <div class="absolute bottom-4 left-4 bg-black/75 backdrop-blur border border-slate-800 px-3 py-1 rounded-lg text-xs font-mono text-slate-300 flex items-center gap-2">
+      <span id="resolutionLabel">1080p 30fps</span>
+      <span>•</span>
+      <span id="fpsLabel" class="text-amber-400">Sent: 0</span>
+    </div>
+  </main>
+
+  <!-- Bottom Controls -->
+  <footer class="bg-slate-900/90 border border-slate-800 p-4 rounded-2xl backdrop-blur flex flex-col gap-3">
+    <!-- Lens / Zoom Quick Controls -->
+    <div class="flex items-center justify-between gap-2">
+      <span class="text-xs text-slate-400 font-semibold">Optical Lens:</span>
+      <div class="flex items-center gap-1.5">
+        <button class="btn-lens px-3 py-1 bg-amber-600 text-white text-xs font-bold rounded-lg transition" data-zoom="1.0">1x Main</button>
+        <button class="btn-lens px-3 py-1 bg-slate-800 hover:bg-slate-700 active:bg-amber-600 text-xs font-bold rounded-lg transition" data-zoom="3.0">3x Tele</button>
+        <button class="btn-lens px-3 py-1 bg-slate-800 hover:bg-slate-700 active:bg-amber-600 text-xs font-bold rounded-lg transition" data-zoom="10.0">10x Super</button>
+      </div>
+    </div>
+
+    <!-- Main Start/Stop Stream Button -->
+    <button id="btnToggleBroadcast" class="w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 active:scale-98 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20">
+      <span>📹</span> <span id="btnToggleText">Start Streaming Rear Camera</span>
+    </button>
+  </footer>
+
+
+  <script>
+    const videoPreview = document.getElementById("videoPreview");
+    const btnToggleBroadcast = document.getElementById("btnToggleBroadcast");
+    const btnToggleText = document.getElementById("btnToggleText");
+    const streamStatusBadge = document.getElementById("streamStatusBadge");
+    const motionAlert = document.getElementById("motionAlert");
+    const errorBanner = document.getElementById("errorBanner");
+    const errorMessage = document.getElementById("errorMessage");
+    const resolutionLabel = document.getElementById("resolutionLabel");
+    const fpsLabel = document.getElementById("fpsLabel");
+    const lensButtons = document.querySelectorAll(".btn-lens");
+
+    let currentStream = null;
+    let isBroadcasting = false;
+    let broadcastInterval = null;
+    let currentZoom = 1.0;
+    let track = null;
+    let sentFrameCount = 0;
+
+    btnToggleBroadcast.addEventListener("click", toggleBroadcast);
+
+    async function toggleBroadcast() {
+      if (isBroadcasting) {
+        stopBroadcast();
+      } else {
+        await startBroadcast();
+      }
+    }
+
+    async function getCameraStream() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("getUserMedia is not supported on this browser or context. Please ensure you are visiting via HTTPS (https://...).");
+      }
+
+      // Try environment rear camera with full HD first
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30 }
+          },
+          audio: false
+        });
+      } catch (e1) {
+        console.warn("Tier 1 camera constraints failed, trying generic environment...", e1);
+      }
+
+      // Try basic environment camera
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+          audio: false
+        });
+      } catch (e2) {
+        console.warn("Tier 2 camera constraints failed, trying standard video...", e2);
+      }
+
+      // Fallback to any available video stream
+      return await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: false
+      });
+    }
+
+    async function startBroadcast() {
+      errorBanner.classList.add("hidden");
+      btnToggleText.textContent = "Connecting...";
+      btnToggleBroadcast.disabled = true;
+
+      try {
+        currentStream = await getCameraStream();
+        videoPreview.srcObject = currentStream;
+        await videoPreview.play();
+
+        track = currentStream.getVideoTracks()[0];
+        const settings = track.getSettings ? track.getSettings() : {};
+        if (settings.width && settings.height) {
+          resolutionLabel.textContent = `${settings.width}x${settings.height} @ ${settings.frameRate || 30}fps`;
+        } else {
+          resolutionLabel.textContent = "Camera Live";
+        }
+
+        isBroadcasting = true;
+        sentFrameCount = 0;
+        streamStatusBadge.className = "text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5";
+        streamStatusBadge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Live Broadcast';
+
+        btnToggleBroadcast.disabled = false;
+        btnToggleBroadcast.className = "w-full py-3.5 bg-red-600 hover:bg-red-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-red-600/20";
+        btnToggleText.textContent = "Stop Stream";
+
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+
+    const mobileTargetSelect = document.getElementById("mobileTargetSelect");
+    const motionAlertIcon = document.getElementById("motionAlertIcon");
+    const motionAlertText = document.getElementById("motionAlertText");
+
+    // Fetch initial target
+    fetch("/api/settings").then(r => r.json()).then(data => {
+      if (data && data.target_object && mobileTargetSelect) {
+        mobileTargetSelect.value = data.target_object;
+      }
+    }).catch(() => {});
+
+    if (mobileTargetSelect) {
+      mobileTargetSelect.addEventListener("change", async () => {
+        try {
+          await fetch("/api/target_object", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_object: mobileTargetSelect.value })
+          });
+        } catch (e) {
+          console.warn("Could not sync target:", e);
+        }
+      });
+    }
+
+    let isUploading = false;
+    broadcastInterval = setInterval(async () => {
+      if (!isBroadcasting || videoPreview.videoWidth === 0 || isUploading) return;
+      isUploading = true;
+
+      // Preserve native video sensor aspect ratio (prevent squashing portrait/4:3 into 16:9)
+      const vWidth = videoPreview.videoWidth;
+      const vHeight = videoPreview.videoHeight;
+      if (canvas.width !== vWidth || canvas.height !== vHeight) {
+        canvas.width = vWidth;
+        canvas.height = vHeight;
+      }
+
+      ctx.drawImage(videoPreview, 0, 0, vWidth, vHeight);
+      const b64 = canvas.toDataURL("image/jpeg", 0.75);
+
+      let controller = new AbortController();
+      let timeoutId = setTimeout(() => controller.abort(), 2000);
+
+      try {
+        const resp = await fetch("/api/screen_cam/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            image_base64: b64,
+            device_name: `Samsung Galaxy S21 Ultra (${currentZoom}x)`
+          })
+        });
+        clearTimeout(timeoutId);
+        if (resp.ok) {
+          sentFrameCount++;
+          fpsLabel.textContent = `Live: ${sentFrameCount} frames`;
+          const res = await resp.json();
+          if (res.detected || res.rat_detected) {
+            const emojis = { tree: "🌲", bird: "🐦", pheasant: "🦚", rodent: "🐀", rat: "🐀", horse: "🐴", horses_poo: "🐴💩" };
+            const label = res.label || "Target";
+            const emoji = emojis[res.object_type] || "🎯";
+            motionAlertIcon.textContent = emoji;
+            motionAlertText.textContent = `${label} Identified!`;
+            motionAlert.classList.remove("hidden");
+            if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+            setTimeout(() => motionAlert.classList.add("hidden"), 3000);
+          }
+        }
+      } catch (e) {
+        clearTimeout(timeoutId);
+        console.debug("Frame upload error:", e);
+      } finally {
+        isUploading = false;
+      }
+    }, 120);
+
+      } catch (err) {
+        console.error("Camera startup error:", err);
+        errorBanner.classList.remove("hidden");
+        errorMessage.textContent = err.message || "Could not open camera stream";
+        btnToggleBroadcast.disabled = false;
+        btnToggleText.textContent = "Start Streaming Rear Camera";
+      }
+    }
+
+    function stopBroadcast() {
+      isBroadcasting = false;
+      if (broadcastInterval) clearInterval(broadcastInterval);
+      if (currentStream) {
+        currentStream.getTracks().forEach(t => t.stop());
+        currentStream = null;
+      }
+      videoPreview.srcObject = null;
+
+      streamStatusBadge.className = "text-xs bg-slate-800 text-slate-400 px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5";
+      streamStatusBadge.innerHTML = '<span class="w-2 h-2 rounded-full bg-slate-500"></span> Standby';
+
+      btnToggleBroadcast.className = "w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20";
+      btnToggleText.textContent = "Start Streaming Rear Camera";
+      fpsLabel.textContent = "Sent: 0";
+    }
+
+    lensButtons.forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const zoomVal = parseFloat(btn.getAttribute("data-zoom"));
+        currentZoom = zoomVal;
+        lensButtons.forEach(b => b.className = "btn-lens px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold rounded-lg transition");
+        btn.className = "btn-lens px-3 py-1 bg-amber-600 text-white text-xs font-bold rounded-lg transition";
+
+        if (track && track.getCapabilities) {
+          const caps = track.getCapabilities();
+          if (caps.zoom) {
+            try {
+              await track.applyConstraints({ advanced: [{ zoom: Math.min(caps.zoom.max, zoomVal) }] });
+            } catch (e) {
+              console.warn("Hardware zoom error:", e);
+            }
+          }
+        }
+      });
+    });
+  </script>
+</body>
+</html>

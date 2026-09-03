@@ -1,0 +1,23 @@
+[Unit]
+Description=vLLM Gemma 4 26B-A4B NVFP4 Engine
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+User=dgxuser
+WorkingDirectory=/home/dgxuser/ratwatch
+ExecStart=/usr/local/bin/vllm serve /models/gemma-4-26b-a4b-nvfp4 \
+    --served-model-name gemma4-26b \
+    --max-model-len 8192 \
+    --max-num-seqs 4 \
+    --gpu-memory-utilization 0.55 \
+    --moe-backend marlin \
+    --kv-cache-dtype fp8 \
+    --enforce-eager false
+Restart=always
+RestartSec=5
+Environment=NVIDIA_VISIBLE_DEVICES=0
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

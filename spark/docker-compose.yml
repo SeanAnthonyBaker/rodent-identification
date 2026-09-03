@@ -1,0 +1,48 @@
+version: "3.8"
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: ratwatch-vllm-26b
+    restart: unless-stopped
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    volumes:
+      - /models/gemma-4-26b-a4b-nvfp4:/model:ro
+    command: >
+      /model
+      --served-model-name gemma4-26b
+      --max-model-len 8192
+      --max-num-seqs 4
+      --gpu-memory-utilization 0.55
+      --moe-backend marlin
+      --kv-cache-dtype fp8
+      --enforce-eager false
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: ratwatch-spark-api
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      VLLM_URL: "http://127.0.0.1:8000/v1"
+      VLLM_MODEL: "gemma4-26b"
+      WATCH_URL: "http://watch.local:8099/alert"
+      PHONE_BRIDGE_URL: "http://s21.local:8098/bridge-alert"
+      CONFIRM_MIN: "0.55"
+      VISION_TOKENS: "280"
+      THINKING: "off"
+    depends_on:
+      - vllm
