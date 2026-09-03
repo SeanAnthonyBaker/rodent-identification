@@ -1,6 +1,8 @@
 import asyncio
 import io
 import json
+import os
+import subprocess
 import logging
 import tempfile
 import time
@@ -53,10 +55,11 @@ class MjpegStreamBroadcaster:
     async def _stream_loop(self):
         while self._is_running:
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
+                stream_timeout = httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=None)
+                async with httpx.AsyncClient(timeout=stream_timeout) as client:
                     async with client.stream("GET", self.stream_url) as resp:
                         if resp.status_code != 200:
-                            await asyncio.sleep(2.0)
+                            await asyncio.sleep(1.0)
                             continue
                         
                         buffer = bytearray()
@@ -65,18 +68,39 @@ class MjpegStreamBroadcaster:
                                 break
                             buffer.extend(chunk)
                             while True:
-                                start = buffer.find(b"\xff\xd8")
-                                if start == -1:
-                                    buffer.clear()
-                                    break
-                                end = buffer.find(b"\xff\xd9", start + 2)
-                                if end == -1:
-                                    if start > 0:
-                                        del buffer[:start]
-                                    break
-                                
-                                jpeg_frame = bytes(buffer[start:end+2])
-                                del buffer[:end+2]
+                                # 1. Try deterministic Content-Length framing from IP Webcam
+                                cl_idx = buffer.find(b"Content-Length: ")
+                                if cl_idx == -1:
+                                    cl_idx = buffer.find(b"content-length: ")
+                                if cl_idx != -1:
+                                    h_end = buffer.find(b"\r\n\r\n", cl_idx)
+                                    if h_end != -1:
+                                        try:
+                                            length_bytes = buffer[cl_idx+16:h_end].split(b"\r\n")[0].strip()
+                                            length = int(length_bytes)
+                                            f_start = h_end + 4
+                                            if len(buffer) < f_start + length:
+                                                break
+                                            jpeg_frame = bytes(buffer[f_start:f_start+length])
+                                            del buffer[:f_start+length]
+                                        except (ValueError, IndexError):
+                                            del buffer[:h_end+4]
+                                            continue
+                                    else:
+                                        break
+                                else:
+                                    # Fallback marker search if server doesn't send Content-Length
+                                    start = buffer.find(b"\xff\xd8")
+                                    if start == -1:
+                                        buffer.clear()
+                                        break
+                                    end = buffer.find(b"\xff\xd9", start + 2)
+                                    if end == -1:
+                                        if start > 0:
+                                            del buffer[:start]
+                                        break
+                                    jpeg_frame = bytes(buffer[start:end+2])
+                                    del buffer[:end+2]
                                 
                                 self._latest_frame = jpeg_frame
                                 
@@ -98,7 +122,7 @@ class MjpegStreamBroadcaster:
                 break
             except Exception as e:
                 logger.debug(f"S21 MJPEG stream broadcaster reconnecting: {e}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.2)
 
 
 class LocalRolandCamera:
@@ -172,7 +196,11 @@ class AndroidPhoneCamera:
         self.device_id = "phone-cam-s21-ultra"
         self.family = "phone_cameras"
         self.model = "Samsung Galaxy S21 Ultra (Webcam / Wireless Stream)"
-        self.stream_url = stream_url or "http://192.168.1.165:8080/video"
+        
+        # Check if USB ADB physical wire is connected to Roland 1
+        usb_url = self._check_and_setup_usb_forward()
+        self.stream_url = usb_url or stream_url or "http://192.168.1.165:8080/video"
+        
         self.camera_index = camera_index
         self._last_frame_bytes: Optional[bytes] = None
         self._last_frame_time: float = 0.0
@@ -181,21 +209,38 @@ class AndroidPhoneCamera:
         self.broadcaster = MjpegStreamBroadcaster(self.stream_url)
         self.broadcaster.start()
 
+    def _check_and_setup_usb_forward(self) -> Optional[str]:
+        adb_path = r"C:\Users\seanb\AppData\Local\Microsoft\WinGet\Packages\Genymobile.scrcpy_Microsoft.Winget.Source_8wekyb3d8bbwe\scrcpy-win64-v3.3.4\adb.exe"
+        if os.path.exists(adb_path):
+            try:
+                import subprocess
+                devs = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=2).stdout
+                if "device\n" in devs or "\tdevice" in devs:
+                    res = subprocess.run([adb_path, "forward", "tcp:8085", "tcp:8080"], capture_output=True, text=True, timeout=2)
+                    if res.returncode == 0:
+                        logger.info("⚡ S21 Ultra connected via direct high-speed USB cable (http://127.0.0.1:8085)!")
+                        return "http://127.0.0.1:8085/video"
+            except Exception as e:
+                logger.debug(f"ADB USB forward check: {e}")
+        return None
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(timeout=2.0)
         return self._client
 
     async def async_set_orientation(self, orientation: str = "landscape"):
-        """Sets hardware camera orientation on S21 phone ('landscape' = 90 deg clockwise to the right)."""
+        """Sets hardware camera orientation on S21 phone ('landscape' = 90 deg clockwise) and sets quality for 30 FPS."""
         if self.stream_url:
             base_url = self.stream_url.split("/video")[0].split("/shot.jpg")[0]
             try:
                 client = self._get_client()
                 await client.get(f"{base_url}/settings/orientation?set={orientation}", timeout=2.0)
                 logger.info(f"S21 phone camera orientation set to '{orientation}' (90 deg to the right)")
+                await client.get(f"{base_url}/settings/quality?set=35", timeout=2.0)
+                logger.info("S21 phone camera stream quality set to 35% for low-latency 30 FPS bandwidth")
             except Exception as e:
-                logger.debug(f"Error setting phone camera orientation: {e}")
+                logger.debug(f"Error configuring phone camera settings: {e}")
 
     @property
     def battery_life(self) -> int:

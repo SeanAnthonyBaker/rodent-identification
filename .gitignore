@@ -20,6 +20,8 @@ data/*
 !data/.gitkeep
 models/*
 !models/.gitkeep
+*.pt
+*.onnx
 
 # IDE / OS
 .vscode/

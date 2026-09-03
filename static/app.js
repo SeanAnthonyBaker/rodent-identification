@@ -111,6 +111,12 @@ let currentActiveCamera = "Garden";
 let mousePos = null;      // Current mouse position on canvas { x, y, canvas }
 let activeDrawCanvas = null;
 
+// Zone Point Dragging State
+let hoveredPointIndex = -1;
+let isDraggingPoint = false;
+let draggedPointIndex = -1;
+let hasJustDragged = false;
+
 // Per-Camera Digital Zoom & Focus Center State
 const cameraZoomState = {
   Garden: { scale: 1.0, originX: 0.5, originY: 0.5 },
@@ -249,10 +255,15 @@ const gardenBatteryBar = document.getElementById("gardenBatteryBar");
 const cam1BatteryPct = document.getElementById("cam1BatteryPct");
 const cam1BatteryBar = document.getElementById("cam1BatteryBar");
 
-let currentSelectedCamera = "Garden"; // Active camera in view: "Garden", "cam1", or "S21"
+const savedCamera = localStorage.getItem("preferred_camera") || "S21";
+let currentSelectedCamera = savedCamera; // Active camera in view: "S21", "Garden", or "cam1"
 let isRealtimeLiveActive = true;
-let surveillanceZoomState = { scale: 1.0, originX: 0.5, originY: 0.5 };
-const cameraRotationState = { Garden: 0, cam1: 0, S21: 180 };
+const savedRotations = JSON.parse(localStorage.getItem("camera_rotations") || "{}");
+const cameraRotationState = {
+  Garden: savedRotations.Garden ?? 0,
+  cam1: savedRotations.cam1 ?? 0,
+  S21: savedRotations.S21 ?? 0
+};
 
 async function selectActiveCamera(camName) {
   currentSelectedCamera = camName;
@@ -340,11 +351,7 @@ function updateActiveCameraStream(forceReload = false) {
   if (isRealtimeLiveActive) {
     const targetSrc = `/api/camera/${currentSelectedCamera}/live_stream?t=${Date.now()}`;
     if (forceReload || !mainCameraFeedImg.src || !mainCameraFeedImg.src.includes(`/api/camera/${currentSelectedCamera}/live_stream`)) {
-      // Clear src first to force Chromium/WebKit to immediately terminate previous MJPEG socket
-      mainCameraFeedImg.src = "";
-      setTimeout(() => {
-        if (mainCameraFeedImg) mainCameraFeedImg.src = targetSrc;
-      }, 25);
+      mainCameraFeedImg.src = targetSrc;
     }
     if (labelActiveCameraTimestamp) {
       labelActiveCameraTimestamp.textContent = "Real-time Live 🔴";
@@ -357,8 +364,21 @@ function updateActiveCameraStream(forceReload = false) {
   }
 }
 
+function initStreamWatchdog() {
+  if (!mainCameraFeedImg) return;
+  // Silent auto-recovery on network socket failure without flickering
+  mainCameraFeedImg.onerror = () => {
+    setTimeout(() => {
+      if (mainCameraFeedImg && isRealtimeLiveActive) {
+        mainCameraFeedImg.src = `/api/camera/${currentSelectedCamera}/live_stream?t=${Date.now()}`;
+      }
+    }, 1000);
+  };
+}
+
 // Expose globally for inline HTML onchange handlers
 window.selectActiveCamera = selectActiveCamera;
+window.initStreamWatchdog = initStreamWatchdog;
 
 function setRealtimeLive(active) {
   isRealtimeLiveActive = active;
@@ -533,21 +553,13 @@ function initEventListeners() {
   if (btnSelectCam1) btnSelectCam1.addEventListener("click", () => selectActiveCamera("cam1"));
   if (btnSelectS21) btnSelectS21.addEventListener("click", () => selectActiveCamera("S21"));
 
-  // Adjacent Zone Controls for Current Window
-  if (btnDrawActiveZone) {
-    btnDrawActiveZone.addEventListener("click", () => toggleDrawZoneForCamera(currentSelectedCamera));
-  }
-  if (btnSaveActiveZone) {
-    btnSaveActiveZone.addEventListener("click", saveActiveCameraZone);
-  }
-  if (btnClearActiveZone) {
-    btnClearActiveZone.addEventListener("click", () => clearZoneFor(currentSelectedCamera));
-  }
-
   // 90° Rotation for active camera
   if (btnRotateActiveCamera) {
     btnRotateActiveCamera.addEventListener("click", async () => {
       cameraRotationState[currentSelectedCamera] = ((cameraRotationState[currentSelectedCamera] || 0) + 90) % 360;
+      try {
+        localStorage.setItem("camera_rotations", JSON.stringify(cameraRotationState));
+      } catch (e) {}
       applySurveillanceTransform();
 
       if (currentSelectedCamera === "S21") {
@@ -602,7 +614,8 @@ window.setSurveillanceZoom = setSurveillanceZoom;
   if (mainSurveillanceContainer) {
     mainSurveillanceContainer.addEventListener("dblclick", (e) => {
       if (isDrawingZone) return;
-      if (e.target.closest("button") || e.target.closest("canvas")) return;
+      if (e.target.closest("button")) return;
+      if (hoveredPointIndex >= 0 || isDraggingPoint) return;
       const rect = mainSurveillanceContainer.getBoundingClientRect();
       const clickX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
       const clickY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
@@ -1553,6 +1566,58 @@ function initWebSocket() {
         return;
       }
 
+      // Stage 1: Object detected in camera zone -> Switch to real-time and draw object boundary ONLY IF IT COULD BE AN ANIMAL
+      if (msg.type === "object_detected") {
+        const payload = msg.data;
+        if (payload.interval_seconds) {
+          sampleInterval = payload.interval_seconds;
+        }
+        // Only bound if candidate could be an animal
+        if (payload.object_boundary && payload.is_animal !== false) {
+          lastDetectedTargetBox = payload.object_boundary;
+          lastDetectedTargetTime = Date.now();
+          if (!lastDetectedTargetLabel || lastDetectedTargetLabel === "Detecting Animal...") {
+            lastDetectedTargetLabel = "Detecting Animal...";
+            lastDetectedTargetType = "candidate_animal";
+            lastDetectedTargetConf = null;
+          }
+          renderRoiCanvas();
+        } else if (!payload.object_boundary && (Date.now() - lastDetectedTargetTime > 1500)) {
+          lastDetectedTargetBox = null;
+          renderRoiCanvas();
+        }
+        if (liveFrameAnalysisStatus) {
+          liveFrameAnalysisStatus.textContent = payload.is_animal !== false
+            ? `⚡ Potential Animal in Zone — Real-Time Active (${payload.interval_seconds || 1}s)`
+            : `⚡ Zone Activity (${(payload.delta_percent || 0).toFixed(1)}% delta) — Real-Time Active (${payload.interval_seconds || 1}s)`;
+        }
+        if (samplingStatusText) {
+          samplingStatusText.textContent = `⚡ Real-Time Active (${payload.interval_seconds || 1}s)`;
+          samplingStatusText.className = "text-xs font-bold text-amber-400 animate-pulse";
+        }
+        return;
+      }
+
+      // Cadence reversion after quiet cooldown
+      if (msg.type === "cadence_changed") {
+        const payload = msg.data;
+        if (payload.interval_seconds) {
+          sampleInterval = payload.interval_seconds;
+        }
+        if (payload.sampling_cadence === "idle") {
+          lastDetectedTargetBox = null;
+          if (liveFrameAnalysisStatus) {
+            liveFrameAnalysisStatus.textContent = `Monitoring (Sampling every ${payload.interval_seconds}s)`;
+          }
+          if (samplingStatusText) {
+            samplingStatusText.textContent = `🟢 Watchdog Active (Sampling ${payload.interval_seconds}s)`;
+            samplingStatusText.className = "text-xs font-medium text-emerald-400";
+          }
+          renderRoiCanvas();
+        }
+        return;
+      }
+
       if (msg.type === "sample_completed") {
         const payload = msg.data;
         
@@ -1566,12 +1631,16 @@ function initWebSocket() {
         const tagEmoji = meta.emoji;
         const tagLabel = meta.label;
 
-        if (isHit) {
+        if (isHit && payload.bounding_box) {
           lastDetectedTargetBox = payload.bounding_box;
           lastDetectedTargetTime = Date.now();
           lastDetectedTargetLabel = tagLabel;
           lastDetectedTargetType = payload.object_type || "target";
           lastDetectedTargetConf = payload.confidence || 0.0;
+        } else {
+          // Clear bounding box if not an animal
+          lastDetectedTargetBox = null;
+          renderRoiCanvas();
         }
 
         // Update header indicator badge
@@ -1998,15 +2067,6 @@ async function saveSettings() {
 // --- Interactive ROI Polygon Drawing System (Independent Per-Camera) ---
 function getRoiCanvases() {
   const list = [];
-  if (roiCanvasGarden) list.push(roiCanvasGarden);
-  if (roiCanvasCam1) list.push(roiCanvasCam1);
-  if (roiCanvasS21) list.push(roiCanvasS21);
-  if (roiCanvas && !list.includes(roiCanvas)) list.push(roiCanvas);
-  return list;
-}
-
-function getRoiCanvases() {
-  const list = [];
   if (mainCameraRoiCanvas) list.push(mainCameraRoiCanvas);
   if (roiCanvas && !list.includes(roiCanvas)) list.push(roiCanvas);
   return list;
@@ -2014,6 +2074,17 @@ function getRoiCanvases() {
 
 function getCameraForCanvas(canvas) {
   return currentSelectedCamera || "Garden";
+}
+
+function getPointAtCoordinates(normX, normY, poly, rect) {
+  if (!poly || !Array.isArray(poly) || poly.length === 0) return -1;
+  const thresholdPx = 16;
+  for (let i = 0; i < poly.length; i++) {
+    const pt = poly[i];
+    const dist = Math.hypot((normX - pt.x) * rect.width, (normY - pt.y) * rect.height);
+    if (dist <= thresholdPx) return i;
+  }
+  return -1;
 }
 
 function initRoiDrawing() {
@@ -2040,10 +2111,13 @@ function initRoiDrawing() {
 
   const canvases = getRoiCanvases();
   canvases.forEach((cvs) => {
+    cvs.addEventListener("mousedown", handleCanvasMouseDown);
     cvs.addEventListener("click", handleCanvasClick);
     cvs.addEventListener("mousemove", handleCanvasMouseMove);
+    cvs.addEventListener("mouseleave", handleCanvasMouseLeave);
     cvs.addEventListener("dblclick", handleCanvasDblClick);
   });
+  window.addEventListener("mouseup", handleCanvasMouseUp);
 
   const resizeObserver = new ResizeObserver(() => {
     resizeRoiCanvas();
@@ -2071,6 +2145,7 @@ function initRoiDrawing() {
     }
   });
 
+  initStreamWatchdog();
   updateRoiUiState();
   renderRoiCanvas();
 }
@@ -2100,17 +2175,25 @@ function toggleDrawZoneForCamera(cameraName) {
   } else {
     currentDrawingCamera = cameraName;
     isDrawingZone = true;
-    currentPolygon = [];
+
+    // If existing polygon exists, load into currentPolygon for dragging and editing
+    const existing = cameraPolygons[cameraName] || (cameraName === currentActiveCamera ? activePolygon : null);
+    if (existing && Array.isArray(existing) && existing.length >= 3) {
+      currentPolygon = existing.map(pt => ({ ...pt }));
+    } else {
+      currentPolygon = [];
+    }
     mousePos = null;
 
     const canvases = getRoiCanvases();
     canvases.forEach((cvs) => {
       cvs.classList.remove("pointer-events-none");
-      cvs.classList.add("cursor-crosshair");
+      cvs.classList.add("pointer-events-auto");
+      cvs.style.cursor = "crosshair";
     });
 
     if (drawInstructions) {
-      drawInstructions.innerHTML = `<span>🎯</span> Click points on <b>${cameraName}</b> camera to draw zone. Double-click or click start point to close.`;
+      drawInstructions.innerHTML = `<span>🎯</span> Drag points to reshape or click to add points on <b>${cameraName}</b>. Double-click or click start point to finish.`;
       drawInstructions.classList.remove("hidden");
     }
 
@@ -2128,20 +2211,144 @@ function cancelZoneDrawing() {
   currentPolygon = [];
   mousePos = null;
   activeDrawCanvas = null;
-
-  const canvases = getRoiCanvases();
-  canvases.forEach((cvs) => {
-    cvs.classList.add("pointer-events-none");
-    cvs.classList.remove("cursor-crosshair");
-  });
+  hoveredPointIndex = -1;
+  isDraggingPoint = false;
+  draggedPointIndex = -1;
 
   if (drawInstructions) drawInstructions.classList.add("hidden");
   updateRoiUiState();
   renderRoiCanvas();
 }
 
+function handleCanvasMouseDown(e) {
+  const canvas = e.currentTarget;
+  const rect = canvas.getBoundingClientRect();
+  const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const normY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+
+  const camName = currentSelectedCamera;
+  const activePoly = (isDrawingZone && currentDrawingCamera === camName && currentPolygon.length > 0)
+    ? currentPolygon
+    : (cameraPolygons[camName] || (camName === currentActiveCamera ? activePolygon : null));
+
+  const ptIdx = getPointAtCoordinates(normX, normY, activePoly, rect);
+  if (ptIdx >= 0) {
+    isDraggingPoint = true;
+    draggedPointIndex = ptIdx;
+    hasJustDragged = false;
+    canvas.style.cursor = "grabbing";
+    e.preventDefault();
+    e.stopPropagation();
+  }
+}
+
+function handleCanvasMouseMove(e) {
+  const canvas = e.currentTarget;
+  const rect = canvas.getBoundingClientRect();
+  const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const normY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+
+  const camName = currentSelectedCamera;
+  const activePoly = (isDrawingZone && currentDrawingCamera === camName && currentPolygon.length > 0)
+    ? currentPolygon
+    : (cameraPolygons[camName] || (camName === currentActiveCamera ? activePolygon : null));
+
+  // 1. Dragging an existing vertex point
+  if (isDraggingPoint && draggedPointIndex >= 0 && activePoly && activePoly[draggedPointIndex]) {
+    hasJustDragged = true;
+    activePoly[draggedPointIndex] = {
+      x: Number(normX.toFixed(4)),
+      y: Number(normY.toFixed(4))
+    };
+    renderRoiCanvas();
+    return;
+  }
+
+  // 2. Hover detection over vertex points
+  const ptIdx = getPointAtCoordinates(normX, normY, activePoly, rect);
+  if (ptIdx !== hoveredPointIndex) {
+    hoveredPointIndex = ptIdx;
+    renderRoiCanvas();
+  }
+
+  if (ptIdx >= 0) {
+    canvas.style.cursor = "grab";
+  } else if (isDrawingZone) {
+    canvas.style.cursor = "crosshair";
+    mousePos = { x: normX, y: normY, canvas };
+    renderRoiCanvas();
+  } else {
+    canvas.style.cursor = "default";
+    if (mousePos) {
+      mousePos = null;
+      renderRoiCanvas();
+    }
+  }
+}
+
+async function handleCanvasMouseUp(e) {
+  if (isDraggingPoint) {
+    isDraggingPoint = false;
+    draggedPointIndex = -1;
+    const canvas = mainCameraRoiCanvas;
+    if (canvas) {
+      canvas.style.cursor = (hoveredPointIndex >= 0) ? "grab" : "default";
+    }
+
+    const cam = currentSelectedCamera;
+    const poly = (isDrawingZone && currentDrawingCamera === cam && currentPolygon.length > 0)
+      ? currentPolygon
+      : cameraPolygons[cam];
+
+    if (poly && poly.length >= 3) {
+      cameraPolygons[cam] = [...poly];
+      if (cam === currentActiveCamera) {
+        activePolygon = [...poly];
+      }
+      try {
+        const cached = JSON.parse(localStorage.getItem("rodent_camera_polygons") || "{}");
+        cached[cam] = cameraPolygons[cam];
+        localStorage.setItem("rodent_camera_polygons", JSON.stringify(cached));
+        if (cam === currentActiveCamera) {
+          localStorage.setItem("rodent_detection_polygon", JSON.stringify(cameraPolygons[cam]));
+        }
+      } catch (err) {}
+
+      // Debounced sync to backend
+      try {
+        const polyArray = cameraPolygons[cam].map(p => [Number(p.x.toFixed(4)), Number(p.y.toFixed(4))]);
+        await fetch(`/api/camera/${cam}/zone`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ polygon: polyArray })
+        });
+      } catch (err) {}
+    }
+
+    renderRoiCanvas();
+    updateRoiUiState();
+    setTimeout(() => { hasJustDragged = false; }, 80);
+  }
+}
+
+function handleCanvasMouseLeave(e) {
+  if (hoveredPointIndex >= 0 && !isDraggingPoint) {
+    hoveredPointIndex = -1;
+    renderRoiCanvas();
+  }
+  if (mousePos && !isDraggingPoint) {
+    mousePos = null;
+    renderRoiCanvas();
+  }
+}
+
 function handleCanvasClick(e) {
+  if (hasJustDragged) {
+    hasJustDragged = false;
+    return;
+  }
   if (!isDrawingZone) return;
+
   const canvas = e.currentTarget;
   const rect = canvas.getBoundingClientRect();
   const clickNormX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -2156,28 +2363,13 @@ function handleCanvasClick(e) {
   if (currentPolygon.length >= 3) {
     const first = currentPolygon[0];
     const distPx = Math.hypot((clickNormX - first.x) * rect.width, (clickNormY - first.y) * rect.height);
-    if (distPx < 25) {
+    if (distPx < 22) {
       finishZoneDrawing();
       return;
     }
   }
 
   currentPolygon.push(pt);
-  renderRoiCanvas();
-}
-
-function handleCanvasMouseMove(e) {
-  if (!isDrawingZone) return;
-  const canvas = e.currentTarget;
-  const rect = canvas.getBoundingClientRect();
-  const clickNormX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  const clickNormY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-
-  mousePos = {
-    x: clickNormX,
-    y: clickNormY,
-    canvas
-  };
   renderRoiCanvas();
 }
 
@@ -2205,12 +2397,9 @@ async function finishZoneDrawing() {
   currentPolygon = [];
   mousePos = null;
   activeDrawCanvas = null;
-
-  const canvases = getRoiCanvases();
-  canvases.forEach((cvs) => {
-    cvs.classList.add("pointer-events-none");
-    cvs.classList.remove("cursor-crosshair");
-  });
+  hoveredPointIndex = -1;
+  isDraggingPoint = false;
+  draggedPointIndex = -1;
 
   if (drawInstructions) drawInstructions.classList.add("hidden");
 
@@ -2300,6 +2489,17 @@ function updateRoiUiState() {
   const camPoly = cameraPolygons[cam] || (cam === currentActiveCamera ? activePolygon : null);
   const hasZone = camPoly && camPoly.length >= 3;
 
+  const canvases = getRoiCanvases();
+  canvases.forEach((cvs) => {
+    if (isDrawingZone || hasZone) {
+      cvs.classList.remove("pointer-events-none");
+      cvs.classList.add("pointer-events-auto");
+    } else {
+      cvs.classList.add("pointer-events-none");
+      cvs.classList.remove("pointer-events-auto");
+    }
+  });
+
   if (badgeActiveCameraZone && textActiveCameraZone) {
     if (hasZone) {
       badgeActiveCameraZone.className = "text-xs bg-amber-500/20 text-amber-300 border border-amber-500/40 px-3 py-1.5 rounded-xl font-mono font-bold flex items-center gap-1.5 shadow";
@@ -2347,26 +2547,40 @@ function renderRoiCanvas() {
       ctx.lineTo(camPoly[i].x * w, camPoly[i].y * h);
     }
     ctx.closePath();
-    ctx.fillStyle = "rgba(245, 158, 11, 0.22)";
+    ctx.fillStyle = "rgba(245, 158, 11, 0.18)";
     ctx.fill();
 
+    // Thinner, crisp stroke with subtle glow
     ctx.strokeStyle = "#f59e0b";
-    ctx.lineWidth = 2.5;
-    ctx.shadowColor = "#f59e0b";
-    ctx.shadowBlur = 8;
+    ctx.lineWidth = 1.25;
+    ctx.shadowColor = "rgba(245, 158, 11, 0.4)";
+    ctx.shadowBlur = 2;
     ctx.stroke();
 
     ctx.shadowBlur = 0;
     for (let i = 0; i < camPoly.length; i++) {
       const px = camPoly[i].x * w;
       const py = camPoly[i].y * h;
+      const isHovered = (hoveredPointIndex === i);
+      const isDragged = (isDraggingPoint && draggedPointIndex === i);
+
       ctx.beginPath();
-      ctx.arc(px, py, 4, 0, Math.PI * 2);
-      ctx.fillStyle = "#fbbf24";
+      const r = (isDragged || isHovered) ? 6 : 3.5;
+      ctx.arc(px, py, r, 0, Math.PI * 2);
+      ctx.fillStyle = isDragged ? "#ffffff" : isHovered ? "#fef08a" : "#fbbf24";
       ctx.fill();
-      ctx.strokeStyle = "#000";
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = isDragged ? "#b45309" : "#1e293b";
+      ctx.lineWidth = 1.0;
       ctx.stroke();
+
+      // Pulsing outer halo when hovered or being dragged
+      if (isHovered || isDragged) {
+        ctx.beginPath();
+        ctx.arc(px, py, r + 3.5, 0, Math.PI * 2);
+        ctx.strokeStyle = "rgba(245, 158, 11, 0.75)";
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+      }
     }
 
     // Zone Badge Tag inside polygon
@@ -2377,10 +2591,10 @@ function renderRoiCanvas() {
 
     ctx.font = "11px Inter, sans-serif";
     ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
-    ctx.fillRect(centerX - 60, centerY - 12, 120, 24);
+    ctx.fillRect(centerX - 50, centerY - 11, 100, 22);
     ctx.strokeStyle = "#f59e0b";
     ctx.lineWidth = 1;
-    ctx.strokeRect(centerX - 60, centerY - 12, 120, 24);
+    ctx.strokeRect(centerX - 50, centerY - 11, 100, 22);
     ctx.fillStyle = "#fbbf24";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -2401,8 +2615,8 @@ function renderRoiCanvas() {
       ctx.lineTo(mousePos.x * w, mousePos.y * h);
     }
     ctx.strokeStyle = "#10b981";
-    ctx.lineWidth = 2.5;
-    ctx.setLineDash([5, 4]);
+    ctx.lineWidth = 1.25;
+    ctx.setLineDash([4, 3]);
     ctx.stroke();
     ctx.setLineDash([]);
 
@@ -2414,12 +2628,16 @@ function renderRoiCanvas() {
     for (let i = 0; i < currentPolygon.length; i++) {
       const px = currentPolygon[i].x * w;
       const py = currentPolygon[i].y * h;
+      const isHovered = (hoveredPointIndex === i);
+      const isDragged = (isDraggingPoint && draggedPointIndex === i);
+
       ctx.beginPath();
-      ctx.arc(px, py, i === 0 ? 6 : 4, 0, Math.PI * 2);
-      ctx.fillStyle = i === 0 ? "#ef4444" : "#10b981";
+      const r = (isDragged || isHovered) ? 6 : (i === 0 ? 5 : 3.5);
+      ctx.arc(px, py, r, 0, Math.PI * 2);
+      ctx.fillStyle = isDragged ? "#ffffff" : isHovered ? "#fef08a" : (i === 0 ? "#ef4444" : "#10b981");
       ctx.fill();
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#1e293b";
+      ctx.lineWidth = 1.0;
       ctx.stroke();
 
       if (i === 0) {
@@ -2432,10 +2650,21 @@ function renderRoiCanvas() {
   }
 
   // 3. Render Detected Target Bounding Box
-  if (lastDetectedTargetBox && (Date.now() - lastDetectedTargetTime < 10000)) {
+  if (lastDetectedTargetBox && (Date.now() - lastDetectedTargetTime < 15000)) {
     renderDetectedTargetBoundingBox(ctx, w, h, lastDetectedTargetBox, lastDetectedTargetLabel, lastDetectedTargetType, lastDetectedTargetConf);
   }
 }
+window.cameraPolygons = cameraPolygons;
+window.renderRoiCanvas = renderRoiCanvas;
+window.updateRoiUiState = updateRoiUiState;
+window.setDetectedTarget = (box, label, type, conf) => {
+  lastDetectedTargetBox = box;
+  lastDetectedTargetTime = Date.now();
+  lastDetectedTargetLabel = label;
+  lastDetectedTargetType = type;
+  lastDetectedTargetConf = conf;
+  renderRoiCanvas();
+};
 
 // =========================================================================
 // --- REAL-TIME SCREEN CAM, DIGITAL ZOOM & MOTION DETECTION SYSTEM ---
@@ -3014,22 +3243,83 @@ function drawTargetReticle(ctx, cx, cy, label, type, conf, strokeCol, tagEmoji, 
 
 function renderDetectedTargetBoundingBox(ctx, w, h, box, label, type, conf) {
   if (!box || box.length < 4) return;
+
+  // ONLY bound an object when it could be an animal
+  const nonAnimalTypes = ["clutter", "false_positive_clutter", "none", "shadow", "foliage", "clear", "manure", "horses_poo"];
+  if (type && nonAnimalTypes.includes(type.toLowerCase())) {
+    return;
+  }
+
   // box: [ymin, xmin, ymax, xmax] (normalized 0-1000 or 0-1)
   const ymin = (box[0] > 1 ? box[0] / 1000 : box[0]) * h;
   const xmin = (box[1] > 1 ? box[1] / 1000 : box[1]) * w;
   const ymax = (box[2] > 1 ? box[2] / 1000 : box[2]) * h;
   const xmax = (box[3] > 1 ? box[3] / 1000 : box[3]) * w;
 
-  // Place target horizontally centered and vertically JUST ABOVE the rat
+  const bw = Math.max(12, xmax - xmin);
+  const bh = Math.max(12, ymax - ymin);
+
+  const isTracking = (type === "tracking" || !conf);
+  const meta = getObjectMeta(type, label);
+  const strokeColor = isTracking ? "#38bdf8" : meta.color;
+
+  ctx.save();
+
+  // 1. Draw Object Boundary Rectangle (crisp 1.5px stroke)
+  ctx.strokeStyle = strokeColor;
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(xmin, ymin, bw, bh);
+
+  // 2. Subtle translucent inner fill
+  ctx.fillStyle = isTracking ? "rgba(56, 189, 248, 0.12)" : "rgba(239, 68, 68, 0.14)";
+  ctx.fillRect(xmin, ymin, bw, bh);
+
+  // 3. Four High-Contrast Corner Brackets
+  const cornerLen = Math.min(14, Math.min(bw, bh) / 3);
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = strokeColor;
+
+  // Top-left
+  ctx.beginPath();
+  ctx.moveTo(xmin, ymin + cornerLen);
+  ctx.lineTo(xmin, ymin);
+  ctx.lineTo(xmin + cornerLen, ymin);
+  ctx.stroke();
+
+  // Top-right
+  ctx.beginPath();
+  ctx.moveTo(xmax - cornerLen, ymin);
+  ctx.lineTo(xmax, ymin);
+  ctx.lineTo(xmax, ymin + cornerLen);
+  ctx.stroke();
+
+  // Bottom-left
+  ctx.beginPath();
+  ctx.moveTo(xmin, ymax - cornerLen);
+  ctx.lineTo(xmin, ymax);
+  ctx.lineTo(xmin + cornerLen, ymax);
+  ctx.stroke();
+
+  // Bottom-right
+  ctx.beginPath();
+  ctx.moveTo(xmax - cornerLen, ymax);
+  ctx.lineTo(xmax, ymax);
+  ctx.lineTo(xmax, ymax - cornerLen);
+  ctx.stroke();
+
+  // 4. Reticle & Floating AI Identification Tag
   const cx = (xmin + xmax) / 2;
-  const reticleRadius = 15;
-  let cy = ymin - reticleRadius - 12;
-  if (cy < 35) {
+  const reticleRadius = 14;
+  let cy = ymin - reticleRadius - 10;
+  if (cy < 32) {
     cy = ymin + reticleRadius + 6;
   }
 
-  const meta = getObjectMeta(type, label);
-  drawTargetReticle(ctx, cx, cy, meta.label, type, conf, meta.color, meta.emoji, ymin);
+  const displayLabel = isTracking ? "Candidate Object" : meta.label;
+  const displayEmoji = isTracking ? "⚡" : meta.emoji;
+  drawTargetReticle(ctx, cx, cy, displayLabel, type, conf, strokeColor, displayEmoji, ymin);
+
+  ctx.restore();
 }
 
 function renderDetectedRatBoundingBox(ctx, w, h, box) {

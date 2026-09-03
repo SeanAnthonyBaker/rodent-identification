@@ -112,6 +112,16 @@ class MotionCascadePipeline:
                 motion_boxes.append((x, y, bw, bh))
 
         has_motion = len(motion_boxes) > 0 or motion_percent > 0.35
+        primary_boundary = None
+        if motion_boxes:
+            sorted_boxes = sorted(motion_boxes, key=lambda b: b[2] * b[3], reverse=True)
+            bx, by, bbw, bbh = sorted_boxes[0]
+            ymin = int((by / h) * 1000)
+            xmin = int((bx / w) * 1000)
+            ymax = int(((by + bbh) / h) * 1000)
+            xmax = int(((bx + bbw) / w) * 1000)
+            primary_boundary = [max(0, min(1000, ymin)), max(0, min(1000, xmin)), max(0, min(1000, ymax)), max(0, min(1000, xmax))]
+
         crop_bytes, crop_bbox, shape = self.extract_target_zone_crop(image_bytes, polygon)
 
         return {
@@ -120,6 +130,7 @@ class MotionCascadePipeline:
             "motion_percent": round(motion_percent, 2),
             "delta_percent": round(motion_percent, 2),
             "motion_boxes": motion_boxes,
+            "object_boundary": primary_boundary,
             "roi_crop_bytes": crop_bytes or image_bytes,
             "focused_crop_bytes": crop_bytes or image_bytes,
             "crop_bbox": crop_bbox,
@@ -234,6 +245,15 @@ class MotionCascadePipeline:
                 delta_boxes.append((x, y, bw, bh))
 
         has_material_delta = delta_percent >= delta_threshold or len(delta_boxes) > 0
+        primary_boundary = None
+        if delta_boxes:
+            sorted_boxes = sorted(delta_boxes, key=lambda b: b[2] * b[3], reverse=True)
+            bx, by, bbw, bbh = sorted_boxes[0]
+            ymin = int((by / h) * 1000)
+            xmin = int((bx / w) * 1000)
+            ymax = int(((by + bbh) / h) * 1000)
+            xmax = int(((bx + bbw) / w) * 1000)
+            primary_boundary = [max(0, min(1000, ymin)), max(0, min(1000, xmin)), max(0, min(1000, ymax)), max(0, min(1000, xmax))]
 
         # 7. Extract high-resolution crop of the target zone
         crop_bytes, crop_bbox, shape = self.extract_target_zone_crop(current_bytes, polygon)
@@ -244,6 +264,7 @@ class MotionCascadePipeline:
             "delta_percent": round(delta_percent, 2),
             "motion_percent": round(delta_percent, 2),
             "delta_boxes": delta_boxes,
+            "object_boundary": primary_boundary,
             "focused_crop_bytes": crop_bytes or current_bytes,
             "roi_crop_bytes": crop_bytes or current_bytes,
             "crop_bbox": crop_bbox,

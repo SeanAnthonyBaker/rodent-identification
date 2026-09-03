@@ -195,7 +195,7 @@
         
         <!-- Synchronized Transform Layer: BOTH image and canvas share this exact transform container so zone NEVER drifts on zoom -->
         <div id="surveillanceTransformLayer" class="relative w-full h-full flex items-center justify-center pointer-events-none transition-transform duration-300">
-          <img id="mainCameraFeedImg" src="/api/camera/Garden/live_stream" alt="Active Camera Feed" class="max-w-full max-h-full object-contain pointer-events-auto" />
+          <img id="mainCameraFeedImg" src="/api/camera/S21/live_stream" alt="Active Camera Feed" class="max-w-full max-h-full object-contain pointer-events-auto" />
           <canvas id="mainCameraRoiCanvas" class="absolute inset-0 w-full h-full pointer-events-auto cursor-crosshair z-10"></canvas>
         </div>
 
@@ -215,9 +215,9 @@
         <div class="absolute bottom-4 left-4 flex items-center gap-2 z-20 pointer-events-none flex-wrap">
           <div class="bg-black/90 backdrop-blur border border-slate-700 text-slate-200 text-xs font-mono px-3 py-1.5 rounded-xl shadow-xl flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-            <span id="labelActiveCameraName" class="font-bold text-white">Garden</span>
+            <span id="labelActiveCameraName" class="font-bold text-white">Samsung S21 Ultra</span>
             <span class="text-slate-500">&bull;</span>
-            <span id="labelActiveCameraTimestamp" class="text-amber-300 font-semibold">Live Real-time</span>
+            <span id="labelActiveCameraTimestamp" class="text-amber-300 font-semibold">Real-time Live 🔴</span>
           </div>
           <div class="bg-black/90 backdrop-blur border border-slate-700 text-slate-300 text-xs font-mono px-3 py-1.5 rounded-xl flex items-center gap-2 shadow-xl">
             <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
@@ -666,6 +666,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=device_power_slot4_v9"></script>
+  <script src="/static/app.js?v=no_flicker_v19"></script>
 </body>
 </html>

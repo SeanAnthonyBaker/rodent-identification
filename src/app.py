@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -139,7 +140,7 @@ class SelectCameraPayload(BaseModel):
 
 @app.post("/api/cameras/select")
 async def select_camera(payload: SelectCameraPayload):
-    """Switches the active Ring camera."""
+    """Switches the active camera and moves S21 to continuous real-time analysis."""
     success = ring_manager.select_camera(payload.camera_name)
     if not success:
         raise HTTPException(status_code=404, detail=f"Camera '{payload.camera_name}' not found")
@@ -147,6 +148,13 @@ async def select_camera(payload: SelectCameraPayload):
     # Update active detection polygon to the newly selected camera's specific zone
     active_zone = inference_client.get_camera_polygon(payload.camera_name)
     inference_client.detection_polygon = active_zone
+
+    is_s21 = any(k in payload.camera_name.lower() for k in ["s21", "phone", "galaxy", "android"])
+    if is_s21:
+        sampler_engine.current_interval_seconds = sampler_engine.active_detection_interval_seconds
+        logger.info(f"⚡ S21 camera selected -> Switched to REAL-TIME continuous analysis ({sampler_engine.active_detection_interval_seconds}s)")
+    else:
+        sampler_engine.current_interval_seconds = sampler_engine.base_interval_seconds
 
     try:
         config_file = Path("config.yaml")
@@ -170,7 +178,9 @@ async def select_camera(payload: SelectCameraPayload):
         "data": {
             "active_camera": ring_manager.camera_name,
             "health": ring_manager.get_health_status(),
-            "detection_polygon": active_zone
+            "detection_polygon": active_zone,
+            "is_realtime": is_s21,
+            "interval_seconds": sampler_engine.current_interval_seconds
         }
     })
     
@@ -585,11 +595,17 @@ async def live_camera_stream(camera_name: str):
             try:
                 first_frame = target_cam.broadcaster.latest_frame
                 if first_frame:
-                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + first_frame + b"\r\n")
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(first_frame)).encode() + b"\r\n\r\n" + first_frame + b"\r\n")
                 
                 while True:
-                    frame = await q.get()
-                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+                    try:
+                        frame = await asyncio.wait_for(q.get(), timeout=1.5)
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                    except asyncio.TimeoutError:
+                        # Heartbeat: if phone connection dropped/reconnecting, send latest frame so browser socket stays alive
+                        latest = target_cam.broadcaster.latest_frame
+                        if latest:
+                            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(latest)).encode() + b"\r\n\r\n" + latest + b"\r\n")
             except (asyncio.CancelledError, GeneratorExit):
                 pass
             finally:
@@ -601,7 +617,8 @@ async def live_camera_stream(camera_name: str):
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
                 "Pragma": "no-cache",
-                "Expires": "0"
+                "Expires": "0",
+                "Connection": "keep-alive"
             }
         )
 
@@ -616,8 +633,10 @@ async def live_camera_stream(camera_name: str):
         
         bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
         real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
+        init_hud = apply_live_cctv_hud(init_frame, real_cam_name, bat)
         yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + apply_live_cctv_hud(init_frame, real_cam_name, bat) + b"\r\n")
+               b"Content-Type: image/jpeg\r\n"
+               b"Content-Length: " + str(len(init_hud)).encode() + b"\r\n\r\n" + init_hud + b"\r\n")
 
         # 2. Continuous real-time stream loop
         last_fetch_time = time.time()
@@ -641,7 +660,8 @@ async def live_camera_stream(camera_name: str):
                 real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
                 live_frame = apply_live_cctv_hud(frame, real_cam_name, bat)
                 yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n" + live_frame + b"\r\n")
+                       b"Content-Type: image/jpeg\r\n"
+                       b"Content-Length: " + str(len(live_frame)).encode() + b"\r\n\r\n" + live_frame + b"\r\n")
             
             sleep_duration = 0.04 if is_phone else 0.25
             await asyncio.sleep(sleep_duration)
