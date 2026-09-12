@@ -599,13 +599,13 @@ async def live_camera_stream(camera_name: str):
                 
                 while True:
                     try:
-                        frame = await asyncio.wait_for(q.get(), timeout=1.5)
+                        frame = await asyncio.wait_for(q.get(), timeout=1.0)
                         yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
                     except asyncio.TimeoutError:
-                        # Heartbeat: if phone connection dropped/reconnecting, send latest frame so browser socket stays alive
                         latest = target_cam.broadcaster.latest_frame
-                        if latest:
-                            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(latest)).encode() + b"\r\n\r\n" + latest + b"\r\n")
+                        if not latest:
+                            latest = ring_manager.create_standby_frame("Connecting S21 Camera...", "S21")
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(latest)).encode() + b"\r\n\r\n" + latest + b"\r\n")
             except (asyncio.CancelledError, GeneratorExit):
                 pass
             finally:
@@ -690,6 +690,33 @@ async def rotate_s21_camera(orientation: Optional[str] = "landscape"):
 @app.get("/api/camera/live_stream")
 async def live_video_stream():
     """Serves high-frame-rate MJPEG video stream to any web viewer."""
+    target_cam = ring_manager.find_camera("S21") or ring_manager._active_camera
+    from src.ring_client import AndroidPhoneCamera
+    if isinstance(target_cam, AndroidPhoneCamera) and hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
+        q = target_cam.broadcaster.subscribe()
+        async def phone_stream():
+            try:
+                first_frame = target_cam.broadcaster.latest_frame
+                if first_frame:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(first_frame)).encode() + b"\r\n\r\n" + first_frame + b"\r\n")
+                while True:
+                    try:
+                        frame = await asyncio.wait_for(q.get(), timeout=1.5)
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
+                    except asyncio.TimeoutError:
+                        latest = target_cam.broadcaster.latest_frame
+                        if latest:
+                            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(latest)).encode() + b"\r\n\r\n" + latest + b"\r\n")
+            except (asyncio.CancelledError, GeneratorExit):
+                pass
+            finally:
+                target_cam.broadcaster.unsubscribe(q)
+        return StreamingResponse(
+            phone_stream(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0", "Connection": "keep-alive"}
+        )
+
     async def frame_generator():
         last_fetch_time = 0.0
         while True:

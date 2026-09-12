@@ -377,17 +377,17 @@ class RingManager:
 
     def __init__(self, token_file: str = "ring_token.json", device_name: Optional[str] = None, mock_fallback: bool = True):
         self.token_file = Path(token_file)
-        self.device_name = device_name or "Garden"
+        self.device_name = device_name or "Samsung Galaxy S21 Ultra"
         self.mock_fallback = mock_fallback
         self._auth = None
         self._ring = None
-        self._active_camera = None
         self._all_cameras = []
         self._is_mock = False
         self._local_cam = LocalRolandCamera("Local Camera (Roland 1)", 0)
         from src.config import config
-        phone_url = getattr(config.ring, "phone_camera_url", "http://192.168.1.150:8080/video")
+        phone_url = getattr(config.ring, "phone_camera_url", "http://192.168.1.165:8080/video")
         self._phone_cam = AndroidPhoneCamera("Samsung Galaxy S21 Ultra", stream_url=phone_url)
+        self._active_camera = self._phone_cam
         self._snapshot_cache: Dict[str, bytes] = {}
         self._last_event_ids: Dict[str, str] = {}
         self._last_vod_trigger_times: Dict[str, float] = {}
@@ -416,12 +416,13 @@ class RingManager:
             logger.error(f"Failed saving updated Ring token: {e}")
 
     async def async_connect(self):
-        """Connects to Ring API and prioritizes Garden and cam1."""
-        self._all_cameras = [self._local_cam, self._phone_cam]
+        """Connects to Ring API and prioritizes Samsung Galaxy S21 Ultra streaming."""
+        self._all_cameras = [self._phone_cam, self._local_cam]
 
         if not self.token_file.exists():
-            logger.warning(f"Ring token file '{self.token_file}' not found. Defaulting to Local Camera.")
-            self._active_camera = self._local_cam
+            logger.info("Defaulting to Samsung Galaxy S21 Ultra real-time streaming.")
+            self._active_camera = self._phone_cam
+            self.device_name = self._phone_cam.name
             return
 
         try:
@@ -498,10 +499,16 @@ class RingManager:
         if any(k in c_low for k in ["s21", "s1", "phone", "galaxy", "android"]):
             return getattr(self, "_phone_cam", None)
         if "garden" in c_low:
-            return next((c for c in self._all_cameras if "garden" in c.name.lower()), None)
+            matched = next((c for c in self._all_cameras if "garden" in c.name.lower()), None)
+            if matched:
+                return matched
+            return getattr(self, "_phone_cam", None)
         if "cam1" in c_low or "cam 1" in c_low:
-            return next((c for c in self._all_cameras if "cam1" in c.name.lower() or "cam 1" in c.name.lower()), None)
-        return None
+            matched = next((c for c in self._all_cameras if "cam1" in c.name.lower() or "cam 1" in c.name.lower()), None)
+            if matched:
+                return matched
+            return getattr(self, "_phone_cam", None)
+        return self._active_camera or getattr(self, "_phone_cam", None)
 
     def select_camera(self, camera_name: str) -> bool:
         """Switches active camera to the specified camera name."""

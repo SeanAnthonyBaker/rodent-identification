@@ -106,8 +106,8 @@ let isZoneVisible = true; // Visibility toggle for UI overlay
 let currentPolygon = [];  // Points in progress [{x: 0.1, y: 0.2}, ...]
 let activePolygon = [];   // Saved active zone polygon (for active camera)
 let cameraPolygons = { Garden: null, cam1: null, S21: null }; // Independent per-camera zones
-let currentDrawingCamera = "Garden"; // Camera being drawn on ("Garden", "cam1", or "S21")
-let currentActiveCamera = "Garden";
+let currentDrawingCamera = "S21"; // Camera being drawn on ("Garden", "cam1", or "S21")
+let currentActiveCamera = "S21";
 let mousePos = null;      // Current mouse position on canvas { x, y, canvas }
 let activeDrawCanvas = null;
 
@@ -191,7 +191,8 @@ document.addEventListener("DOMContentLoaded", () => {
   initWebSocket();
   initWebSocket();
   setRealtimeLive(true);
-  selectActiveCamera("Garden");
+  const startCamera = localStorage.getItem("preferred_camera") || "S21";
+  selectActiveCamera(startCamera);
 });
 
 // Single-Device Camera Elements
@@ -266,8 +267,14 @@ const cameraRotationState = {
 };
 
 async function selectActiveCamera(camName) {
+  if (camName && (camName.toLowerCase().includes("s21") || camName.toLowerCase().includes("phone") || camName.toLowerCase().includes("galaxy"))) {
+    camName = "S21";
+  }
   currentSelectedCamera = camName;
   currentActiveCamera = camName;
+  try {
+    localStorage.setItem("preferred_camera", camName);
+  } catch (e) {}
 
   const tabActiveEmerald = "px-3.5 py-1.5 rounded-lg font-bold bg-emerald-600 text-white shadow transition flex items-center gap-1.5";
   const tabActiveAmber = "px-3.5 py-1.5 rounded-lg font-bold bg-amber-600 text-white shadow transition flex items-center gap-1.5";
@@ -2536,7 +2543,7 @@ function renderRoiCanvas() {
   ctx.clearRect(0, 0, w, h);
 
   const camName = currentSelectedCamera;
-  const camPoly = cameraPolygons[camName] || (camName === currentActiveCamera ? activePolygon : null);
+  const camPoly = cameraPolygons[camName] || (camName === "S21" ? cameraPolygons["Garden"] : cameraPolygons["S21"]) || (camName === currentActiveCamera ? activePolygon : null) || activePolygon;
 
   // 1. Render Saved Polygon for current camera
   if (camPoly && camPoly.length >= 3 && (!isDrawingZone || currentDrawingCamera !== camName)) {
