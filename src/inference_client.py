@@ -61,15 +61,17 @@ class RolandInferenceClient:
         self.gemini_model = gemini_model
         self._lock = asyncio.Lock()
 
-    def get_camera_polygon(self, camera_name: Optional[str]) -> Optional[List[List[float]]]:
-        """Gets polygon for specific camera name, with case-insensitive fallback and default fallback."""
+    def get_camera_polygon(self, camera_name: Optional[str], fallback: bool = False) -> Optional[List[List[float]]]:
+        """Gets polygon for specific camera name, with case-insensitive lookup and optional fallback."""
         if camera_name and self.camera_polygons:
             if camera_name in self.camera_polygons:
                 return self.camera_polygons[camera_name]
             for k, v in self.camera_polygons.items():
                 if k.lower() == camera_name.lower():
                     return v
-        return self.detection_polygon
+        if fallback:
+            return self.detection_polygon
+        return None
 
     def apply_polygon_mask(self, image_bytes: bytes, polygon: Optional[List[List[float]]] = None, camera_name: Optional[str] = None) -> bytes:
         """Applies a polygon ROI mask. Everything outside the polygon is blacked out."""

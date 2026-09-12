@@ -74,8 +74,8 @@ const sortDescBtn = document.getElementById("sortDescBtn");
 const btnRefreshGallery = document.getElementById("btnRefreshGallery");
 
 // Live Feed Elements
-const liveFeedImg = document.getElementById("liveFeedImg");
-const liveFeedContainer = document.getElementById("liveFeedContainer");
+const liveFeedImg = document.getElementById("liveFeedImg") || document.getElementById("mainCameraFeedImg");
+const liveFeedContainer = document.getElementById("liveFeedContainer") || document.getElementById("mainSurveillanceContainer");
 const liveFrameTime = document.getElementById("liveFrameTime");
 const liveFrameAnalysisStatus = document.getElementById("liveFrameAnalysisStatus");
 
@@ -106,8 +106,8 @@ let isZoneVisible = true; // Visibility toggle for UI overlay
 let currentPolygon = [];  // Points in progress [{x: 0.1, y: 0.2}, ...]
 let activePolygon = [];   // Saved active zone polygon (for active camera)
 let cameraPolygons = { Garden: null, cam1: null, S21: null }; // Independent per-camera zones
-let currentDrawingCamera = "S21"; // Camera being drawn on ("Garden", "cam1", or "S21")
-let currentActiveCamera = "S21";
+let currentDrawingCamera = "Garden"; // Camera being drawn on ("Garden", "cam1", or "S21")
+let currentActiveCamera = "Garden";
 let mousePos = null;      // Current mouse position on canvas { x, y, canvas }
 let activeDrawCanvas = null;
 
@@ -189,10 +189,9 @@ document.addEventListener("DOMContentLoaded", () => {
   fetchDetections();
   startCountdown();
   initWebSocket();
-  initWebSocket();
   setRealtimeLive(true);
-  const startCamera = localStorage.getItem("preferred_camera") || "S21";
-  selectActiveCamera(startCamera);
+  const savedCam = localStorage.getItem("rodent_selected_camera") || "S21";
+  selectActiveCamera(savedCam);
 });
 
 // Single-Device Camera Elements
@@ -256,43 +255,72 @@ const gardenBatteryBar = document.getElementById("gardenBatteryBar");
 const cam1BatteryPct = document.getElementById("cam1BatteryPct");
 const cam1BatteryBar = document.getElementById("cam1BatteryBar");
 
-const savedCamera = localStorage.getItem("preferred_camera") || "S21";
-let currentSelectedCamera = savedCamera; // Active camera in view: "S21", "Garden", or "cam1"
+const rawSavedCamera = localStorage.getItem("preferred_camera") || "S21";
+const savedCamera = rawSavedCamera.toLowerCase().includes("outhouse") ? "S21" : rawSavedCamera;
+let currentSelectedCamera = savedCamera;
+currentActiveCamera = savedCamera;
 let isRealtimeLiveActive = true;
+
+function isLiveStreamCurrentlyActive() {
+  if (!isRealtimeLiveActive) return false;
+  const targetImg = (typeof mainCameraFeedImg !== "undefined" && mainCameraFeedImg) || (typeof liveFeedImg !== "undefined" && liveFeedImg);
+  if (!targetImg) return false;
+  const src = targetImg.src || "";
+  return src.includes("/live_stream");
+}
+window.isLiveStreamCurrentlyActive = isLiveStreamCurrentlyActive;
+
 const savedRotations = JSON.parse(localStorage.getItem("camera_rotations") || "{}");
+delete savedRotations["Outhouse"];
 const cameraRotationState = {
   Garden: savedRotations.Garden ?? 0,
   cam1: savedRotations.cam1 ?? 0,
-  S21: savedRotations.S21 ?? 0
+  S21: savedRotations.S21 ?? 0,
+  "Galaxy Tab A11+": savedRotations["Galaxy Tab A11+"] ?? 0
 };
 
 async function selectActiveCamera(camName) {
-  if (camName && (camName.toLowerCase().includes("s21") || camName.toLowerCase().includes("phone") || camName.toLowerCase().includes("galaxy"))) {
-    camName = "S21";
+  let normalizedCam = camName;
+  const lower = (camName || "").toLowerCase().trim();
+  if (lower.includes("tab") || lower.includes("a11") || lower.includes("outhouse")) {
+    normalizedCam = "Galaxy Tab A11+";
+  } else if (lower.includes("s21") || lower.includes("phone")) {
+    normalizedCam = "S21";
+  } else if (lower.includes("garden")) {
+    normalizedCam = "Garden";
+  } else if (lower.includes("cam1") || lower.includes("cam 1")) {
+    normalizedCam = "cam1";
   }
-  currentSelectedCamera = camName;
-  currentActiveCamera = camName;
-  try {
-    localStorage.setItem("preferred_camera", camName);
-  } catch (e) {}
+
+  currentSelectedCamera = normalizedCam;
+  currentActiveCamera = normalizedCam;
 
   const tabActiveEmerald = "px-3.5 py-1.5 rounded-lg font-bold bg-emerald-600 text-white shadow transition flex items-center gap-1.5";
   const tabActiveAmber = "px-3.5 py-1.5 rounded-lg font-bold bg-amber-600 text-white shadow transition flex items-center gap-1.5";
   const tabActiveBlue = "px-3.5 py-1.5 rounded-lg font-bold bg-blue-600 text-white shadow transition flex items-center gap-1.5";
   const tabInactive = "px-3.5 py-1.5 rounded-lg font-semibold text-slate-400 hover:text-white transition flex items-center gap-1.5";
 
-  if (btnSelectGarden) btnSelectGarden.className = (camName === "Garden") ? tabActiveEmerald : tabInactive;
-  if (btnSelectCam1) btnSelectCam1.className = (camName === "cam1") ? tabActiveAmber : tabInactive;
-  if (btnSelectS21) btnSelectS21.className = (camName === "S21") ? tabActiveBlue : tabInactive;
+  if (btnSelectGarden) btnSelectGarden.className = (normalizedCam === "Garden") ? tabActiveEmerald : tabInactive;
+  if (btnSelectCam1) btnSelectCam1.className = (normalizedCam === "cam1") ? tabActiveAmber : tabInactive;
+  if (btnSelectS21) btnSelectS21.className = (normalizedCam === "S21") ? tabActiveBlue : tabInactive;
 
-  if (selectActiveDevice && selectActiveDevice.value !== camName) {
-    selectActiveDevice.value = camName;
+  if (selectActiveDevice) {
+    selectActiveDevice.value = normalizedCam;
   }
 
-  if (labelActiveCameraName) labelActiveCameraName.textContent = camName;
+  let labelName = normalizedCam;
+  if (normalizedCam === "S21") labelName = "Samsung Galaxy S21 Ultra";
+  else if (normalizedCam === "Galaxy Tab A11+") labelName = "Samsung Galaxy Tab A11+";
+  else if (normalizedCam === "Garden") labelName = "Garden Camera";
+  else if (normalizedCam === "cam1") labelName = "Cam 1 Camera";
+  if (labelActiveCameraName) labelActiveCameraName.textContent = labelName;
+
   updateActiveDevicePowerCard();
 
-  // Stream update
+  // Reset retry counter for fresh stream connection
+  streamRetryCount = 0;
+
+  // Stream update with forceReload
   updateActiveCameraStream(true);
 
   // Reset zoom on camera switch
@@ -306,24 +334,32 @@ async function selectActiveCamera(camName) {
 
   // Inform backend of primary active camera
   try {
+    localStorage.setItem("rodent_selected_camera", normalizedCam);
+    localStorage.setItem("preferred_camera", normalizedCam);
     await fetch("/api/cameras/select", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ camera_name: camName })
+      body: JSON.stringify({ camera_name: normalizedCam })
     });
-    // Update device power card for selected camera
-    updateActiveDevicePowerCard();
   } catch (e) {}
+
+  // Also refresh console deck to reflect selection
+  if (typeof refreshZoneConsole === "function") {
+    refreshZoneConsole();
+  }
 }
 
 function updateActiveDevicePowerCard() {
+  const card = document.getElementById("cardDevicePower");
+  if (!card) return;
+
   const pctEl = document.getElementById("activeDeviceBatteryPct");
   const barEl = document.getElementById("activeDeviceBatteryBar");
   const nameEl = document.getElementById("activePowerDeviceName");
   const typeEl = document.getElementById("activeDeviceCameraType");
   const iconEl = document.getElementById("activePowerIcon");
 
-  let pct = 95;
+  let pct = 50;
   let devName = currentSelectedCamera;
   let typeName = "Samsung Galaxy S21 Ultra";
 
@@ -335,8 +371,12 @@ function updateActiveDevicePowerCard() {
     pct = 87;
     devName = "cam1 Camera";
     typeName = "Ring Stick Up Cam (3rd Gen)";
+  } else if (currentSelectedCamera === "Galaxy Tab A11+" || (currentSelectedCamera && currentSelectedCamera.toLowerCase().includes("tab"))) {
+    pct = 85;
+    devName = "Galaxy Tab A11+";
+    typeName = "Samsung Galaxy Tab A11+ (IP Cam)";
   } else {
-    pct = 95;
+    pct = 50;
     devName = "Samsung S21 Ultra";
     typeName = "Samsung S21 Ultra (IP Cam)";
   }
@@ -353,39 +393,87 @@ function updateActiveDevicePowerCard() {
 }
 window.updateActiveDevicePowerCard = updateActiveDevicePowerCard;
 
+let streamRetryCount = 0;
+let snapshotFallbackTimer = null;
+
 function updateActiveCameraStream(forceReload = false) {
   if (!mainCameraFeedImg) return;
-  if (isRealtimeLiveActive) {
-    const targetSrc = `/api/camera/${currentSelectedCamera}/live_stream?t=${Date.now()}`;
-    if (forceReload || !mainCameraFeedImg.src || !mainCameraFeedImg.src.includes(`/api/camera/${currentSelectedCamera}/live_stream`)) {
-      mainCameraFeedImg.src = targetSrc;
+  const cam = currentSelectedCamera || "Garden";
+
+  if (snapshotFallbackTimer) {
+    clearInterval(snapshotFallbackTimer);
+    snapshotFallbackTimer = null;
+  }
+
+  if (isRealtimeLiveActive && streamRetryCount < 3) {
+    const encodedCam = encodeURIComponent(cam);
+    const targetPath = `/api/camera/${encodedCam}/live_stream`;
+    if (forceReload || !mainCameraFeedImg.src || !mainCameraFeedImg.src.includes(targetPath)) {
+      mainCameraFeedImg.src = `${targetPath}?t=${Date.now()}`;
     }
     if (labelActiveCameraTimestamp) {
       labelActiveCameraTimestamp.textContent = "Real-time Live 🔴";
     }
   } else {
-    mainCameraFeedImg.src = `/api/camera/${currentSelectedCamera}/snapshot?t=${Date.now()}`;
-    if (labelActiveCameraTimestamp) {
-      labelActiveCameraTimestamp.textContent = `${new Date().toLocaleTimeString()} (Snapshot)`;
-    }
+    // Ultra-reliable seamless snapshot polling fallback (600ms for S21/Tab, 2000ms for Ring)
+    const pollInterval = (cam === "S21" || cam === "Galaxy Tab A11+" || (cam && cam.toLowerCase().includes("tab"))) ? 600 : 2000;
+    const fetchSnapshot = () => {
+      if (!mainCameraFeedImg) return;
+      const snapImg = new Image();
+      snapImg.onload = () => {
+        if (mainCameraFeedImg) {
+          mainCameraFeedImg.src = snapImg.src;
+          if (labelActiveCameraTimestamp) {
+            labelActiveCameraTimestamp.textContent = `${new Date().toLocaleTimeString()} (Live)`;
+          }
+        }
+      };
+      snapImg.src = `/api/camera/${encodeURIComponent(cam)}/snapshot?t=${Date.now()}`;
+    };
+    fetchSnapshot();
+    snapshotFallbackTimer = setInterval(fetchSnapshot, pollInterval);
   }
 }
 
 function initStreamWatchdog() {
   if (!mainCameraFeedImg) return;
-  // Silent auto-recovery on network socket failure without flickering
   mainCameraFeedImg.onerror = () => {
-    setTimeout(() => {
-      if (mainCameraFeedImg && isRealtimeLiveActive) {
-        mainCameraFeedImg.src = `/api/camera/${currentSelectedCamera}/live_stream?t=${Date.now()}`;
-      }
-    }, 1000);
+    streamRetryCount++;
+    console.warn(`Camera feed stream error (attempt ${streamRetryCount}/3) for ${currentSelectedCamera}`);
+    if (streamRetryCount >= 3) {
+      console.warn("Switching to fast snapshot polling fallback for rock-solid live display.");
+      updateActiveCameraStream(true);
+    } else {
+      setTimeout(() => {
+        if (mainCameraFeedImg && isRealtimeLiveActive) {
+          const cam = currentSelectedCamera || "Garden";
+          mainCameraFeedImg.src = `/api/camera/${encodeURIComponent(cam)}/live_stream?t=${Date.now()}`;
+        }
+      }, 1000);
+    }
   };
+  mainCameraFeedImg.onload = () => {
+    streamRetryCount = 0;
+    resizeRoiCanvas();
+  };
+}
+
+function selectCameraByName(name) {
+  selectActiveCamera(name);
+}
+
+function setViewMode(mode) {
+  if (mode && mode !== "all_zones") {
+    selectActiveCamera(mode);
+  }
 }
 
 // Expose globally for inline HTML onchange handlers
 window.selectActiveCamera = selectActiveCamera;
+window.selectCameraByName = selectCameraByName;
+window.setViewMode = setViewMode;
 window.initStreamWatchdog = initStreamWatchdog;
+window.updateActiveCameraStream = updateActiveCameraStream;
 
 function setRealtimeLive(active) {
   isRealtimeLiveActive = active;
@@ -398,7 +486,7 @@ function setRealtimeLive(active) {
       if (labelRealtimeLive) labelRealtimeLive.textContent = "⚪ Paused";
     }
   }
-  updateActiveCameraStream();
+  updateActiveCameraStream(true);
 }
 
 function toggleRealtimeLive() {
@@ -994,9 +1082,9 @@ async function fetchStatus() {
     }
 
     if (data.storage_stats) {
-      statTotalCount.textContent = data.storage_stats.total_detections;
-      totalDetectionsBadge.textContent = `${data.storage_stats.total_detections} Detected`;
-      if (data.storage_stats.latest_detection_timestamp) {
+      if (statTotalCount) statTotalCount.textContent = data.storage_stats.total_detections;
+      if (totalDetectionsBadge) totalDetectionsBadge.textContent = `${data.storage_stats.total_detections} Detected`;
+      if (data.storage_stats.latest_detection_timestamp && latestCaptureTime) {
         latestCaptureTime.textContent = new Date(data.storage_stats.latest_detection_timestamp).toLocaleTimeString();
       }
     }
@@ -1018,8 +1106,8 @@ async function fetchDetections() {
     const data = await res.json();
     detections = data.detections || [];
     
-    statTotalCount.textContent = data.total;
-    totalDetectionsBadge.textContent = `${data.total} Identified`;
+    if (statTotalCount) statTotalCount.textContent = data.total;
+    if (totalDetectionsBadge) totalDetectionsBadge.textContent = `${data.total} Identified`;
 
     if (detections.length === 0) {
       carouselEmptyState.classList.remove("hidden");
@@ -1428,8 +1516,8 @@ async function triggerSampleNow() {
     const res = await fetch("/api/sample_now", { method: "POST" });
     if (res.ok) {
       const data = await res.json();
-      if (data.latest_image_base64 && (Date.now() - lastLiveVideoFrameTime > 3000)) {
-        liveFeedImg.src = data.latest_image_base64;
+      if (data.latest_image_base64 && !isLiveStreamCurrentlyActive()) {
+        if (liveFeedImg) liveFeedImg.src = data.latest_image_base64;
       }
       liveFrameTime.textContent = data.timestamp;
 
@@ -1551,7 +1639,7 @@ function initWebSocket() {
         if (liveFrameAnalysisStatus) {
           liveFrameAnalysisStatus.textContent = `🚨 RAT CONFIRMED (${Math.round(payload.confidence * 100)}%) — ${loc} [Spark: ${payload.spark_ms}ms]`;
         }
-        if (payload.image_base64 && liveFeedImg) {
+        if (payload.image_base64 && liveFeedImg && !isLiveStreamCurrentlyActive()) {
           liveFeedImg.src = payload.image_base64;
         }
         lastDetectedTargetTime = Date.now();
@@ -1666,17 +1754,28 @@ function initWebSocket() {
         }
 
         // Only update image from background sampler if NOT currently receiving real-time live video stream
-        const isLiveStreamingNow = (Date.now() - lastLiveVideoFrameTime < 4000);
-        if (payload.latest_image_base64 && (!isLiveStreamingNow || isHit)) {
-          liveFeedImg.src = payload.latest_image_base64;
+        const isLiveStreamingNow = isLiveStreamCurrentlyActive() || (Date.now() - lastLiveVideoFrameTime < 4000);
+        if (payload.latest_image_base64 && !isLiveStreamingNow) {
+          if (liveFeedImg) liveFeedImg.src = payload.latest_image_base64;
+          renderRoiCanvas();
+        } else {
+          // Keep live video streaming continuously; refresh bounding box overlay on canvas
           renderRoiCanvas();
         }
 
         if (!isLiveStreamingNow) {
-          liveFrameTime.textContent = payload.timestamp;
-          liveFrameAnalysisStatus.textContent = isHit
-            ? `${tagEmoji} ${tagLabel} Detected! (${Math.round(payload.confidence * 100)}%)`
-            : `Clear (${Math.round(payload.confidence * 100)}%)`;
+          if (liveFrameTime) liveFrameTime.textContent = payload.timestamp;
+          if (liveFrameAnalysisStatus) {
+            liveFrameAnalysisStatus.textContent = isHit
+              ? `${tagEmoji} ${tagLabel} Detected! (${Math.round(payload.confidence * 100)}%)`
+              : `Clear (${Math.round(payload.confidence * 100)}%)`;
+          }
+        } else {
+          if (liveFrameAnalysisStatus) {
+            liveFrameAnalysisStatus.textContent = isHit
+              ? `${tagEmoji} ${tagLabel} Detected! (${Math.round(payload.confidence * 100)}%)`
+              : `Live Monitoring (${tagLabel || "Clear"})`;
+          }
         }
 
         // Speak aloud voice alert if enabled
@@ -1994,7 +2093,11 @@ async function loadSettings() {
         const poly = data.camera_polygons[cam];
         if (Array.isArray(poly) && poly.length >= 3) {
           const cLow = cam.toLowerCase();
-          const key = cLow.includes("garden") ? "Garden" : (cLow.includes("cam1") ? "cam1" : "S21");
+          let key = cam;
+          if (cLow.includes("tab") || cLow.includes("a11") || cLow.includes("outhouse")) key = "Galaxy Tab A11+";
+          else if (cLow.includes("garden")) key = "Garden";
+          else if (cLow.includes("cam1") || cLow.includes("cam 1")) key = "cam1";
+          else if (cLow.includes("s21") || cLow.includes("phone")) key = "S21";
           cameraPolygons[key] = poly.map(pt => ({ x: pt[0], y: pt[1] }));
         }
       });
@@ -2002,7 +2105,10 @@ async function loadSettings() {
 
     if (data.active_camera) {
       const aLow = data.active_camera.toLowerCase();
-      currentActiveCamera = aLow.includes("cam1") ? "cam1" : (aLow.includes("s21") || aLow.includes("s1") || aLow.includes("phone") ? "S21" : "Garden");
+      if (aLow.includes("tab") || aLow.includes("a11") || aLow.includes("outhouse")) currentActiveCamera = "Galaxy Tab A11+";
+      else if (aLow.includes("cam1")) currentActiveCamera = "cam1";
+      else if (aLow.includes("s21") || aLow.includes("s1") || aLow.includes("phone")) currentActiveCamera = "S21";
+      else currentActiveCamera = "Garden";
     }
 
     if (data.detection_polygon && Array.isArray(data.detection_polygon) && data.detection_polygon.length >= 3) {
@@ -2105,6 +2211,11 @@ function initRoiDrawing() {
     }
     if (cached.S21 && Array.isArray(cached.S21) && cached.S21.length >= 3) {
       cameraPolygons.S21 = cached.S21;
+    }
+    if (cached["Galaxy Tab A11+"] && Array.isArray(cached["Galaxy Tab A11+"]) && cached["Galaxy Tab A11+"].length >= 3) {
+      cameraPolygons["Galaxy Tab A11+"] = cached["Galaxy Tab A11+"];
+    } else if (cached.Outhouse && Array.isArray(cached.Outhouse) && cached.Outhouse.length >= 3) {
+      cameraPolygons["Galaxy Tab A11+"] = cached.Outhouse;
     }
     const legacy = localStorage.getItem("rodent_detection_polygon");
     if (legacy && !cameraPolygons[currentActiveCamera]) {
@@ -2543,7 +2654,7 @@ function renderRoiCanvas() {
   ctx.clearRect(0, 0, w, h);
 
   const camName = currentSelectedCamera;
-  const camPoly = cameraPolygons[camName] || (camName === "S21" ? cameraPolygons["Garden"] : cameraPolygons["S21"]) || (camName === currentActiveCamera ? activePolygon : null) || activePolygon;
+  const camPoly = cameraPolygons[camName] || (camName === currentActiveCamera ? activePolygon : null);
 
   // 1. Render Saved Polygon for current camera
   if (camPoly && camPoly.length >= 3 && (!isDrawingZone || currentDrawingCamera !== camName)) {
@@ -2895,25 +3006,7 @@ if (btnToggleLiveVideoMode) {
 
 function toggleLiveVideoMode() {
   isContinuousMjpeg = !isContinuousMjpeg;
-  if (isContinuousMjpeg) {
-    liveFeedImg.src = "/api/camera/live_stream?t=" + Date.now();
-    btnToggleLiveVideoMode.className = "px-3.5 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl transition flex items-center gap-1.5 shadow-lg shadow-red-600/20 active:scale-95";
-    liveVideoModeText.textContent = "Live Video Active 🔴";
-    if (liveFrameTime) liveFrameTime.textContent = "Live Continuous Stream (30fps 🔴)";
-  } else {
-    liveFeedImg.src = "/api/camera/latest_snapshot?t=" + Date.now();
-    btnToggleLiveVideoMode.className = "px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold rounded-xl transition flex items-center gap-1.5 shadow-lg shadow-amber-600/20 active:scale-95";
-    liveVideoModeText.textContent = "Continuous Live Video";
-  }
-}
-
-// Auto-start continuous live video stream on load
-if (liveFeedImg) {
-  liveFeedImg.src = "/api/camera/live_stream?t=" + Date.now();
-  if (btnToggleLiveVideoMode) {
-    btnToggleLiveVideoMode.className = "px-3.5 py-1.5 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl transition flex items-center gap-1.5 shadow-lg shadow-red-600/20 active:scale-95";
-    if (liveVideoModeText) liveVideoModeText.textContent = "Live Video Active 🔴";
-  }
+  setRealtimeLive(isContinuousMjpeg);
 }
 
 async function toggleScreenCam() {
@@ -3469,4 +3562,299 @@ document.querySelectorAll(".btn-stretch-preset").forEach(btn => {
     }
   });
 });
+
+// ============================================================================
+// MULTI-CAMERA TARGET ZONE CONSOLE SYSTEM (ZOOMABLE SINGLE-FRAME DECK)
+// ============================================================================
+let consoleZoneScale = 1.0;
+let consoleZoneData = [];
+const tileZoomState = {}; // camName -> { scale: 1.0, originX: 50, originY: 50 }
+
+let zoneConsoleTimer = null;
+let fastLiveZoneTimer = null;
+
+async function initZoneConsole() {
+  await refreshZoneConsole();
+  if (zoneConsoleTimer) clearInterval(zoneConsoleTimer);
+  zoneConsoleTimer = setInterval(refreshZoneConsole, 3500);
+
+  if (fastLiveZoneTimer) clearInterval(fastLiveZoneTimer);
+  fastLiveZoneTimer = setInterval(refreshFastLiveTiles, 1000);
+}
+
+function refreshFastLiveTiles() {
+  const activeSelectors = [
+    '.zone-tile-viewport[data-cam*="Tab"]',
+    '.zone-tile-viewport[data-cam*="Galaxy"]',
+    '.zone-tile-viewport[data-cam*="A11"]',
+    '.zone-tile-viewport[data-cam*="S21"]',
+    '.zone-tile-viewport[data-cam*="Samsung"]',
+    '.zone-tile-viewport[data-cam*="Local"]',
+    '.zone-console-card.border-amber-500 .zone-tile-viewport'
+  ];
+  const liveTiles = document.querySelectorAll(activeSelectors.join(", "));
+  const seenCams = new Set();
+
+  liveTiles.forEach((vp) => {
+    const camName = vp.dataset.cam;
+    if (!camName || seenCams.has(camName)) return;
+    seenCams.add(camName);
+
+    const img = vp.querySelector("img.zone-crop-img");
+    if (img && camName) {
+      const nextSrc = `/api/camera/${encodeURIComponent(camName)}/zone_crop?t=${Date.now()}`;
+      const preloader = new Image();
+      preloader.onload = () => {
+        img.src = preloader.src;
+      };
+      preloader.src = nextSrc;
+    }
+  });
+}
+
+async function refreshZoneConsole() {
+  const deck = document.getElementById("zoneConsoleDeck");
+  if (!deck) return;
+
+  try {
+    const res = await fetch("/api/cameras/zone_summary");
+    if (!res.ok) return;
+    const data = await res.json();
+    consoleZoneData = data.cameras || [];
+    renderZoneConsole(consoleZoneData, data.active_camera);
+  } catch (e) {
+    console.debug("Failed refreshing zone console:", e);
+  }
+}
+
+function renderZoneConsole(cameras, activeCam) {
+  const deck = document.getElementById("zoneConsoleDeck");
+  if (!deck) return;
+
+  // 1. FILTER OUT any device named "outhouse" explicitly
+  const validCameras = (cameras || []).filter(cam => {
+    const n = (cam.name || "").toLowerCase();
+    return !n.includes("outhouse");
+  });
+
+  // 2. ACTIVE DOM PRUNING: Immediately remove zombie "Outhouse" tile and any stale cards
+  const validNameSet = new Set(validCameras.map(c => c.name.toLowerCase()));
+  const existingTiles = deck.querySelectorAll(".zone-console-card");
+  existingTiles.forEach((tile) => {
+    const tileCam = (tile.dataset.cam || "").toLowerCase();
+    if (tileCam.includes("outhouse") || !validNameSet.has(tileCam)) {
+      tile.remove();
+    }
+  });
+
+  const currentCam = (activeCam || currentSelectedCamera || "").toLowerCase();
+
+  validCameras.forEach((cam) => {
+    const cLow = cam.name.toLowerCase();
+    const isTab = cLow.includes("tab") || cLow.includes("a11");
+    const isSelected = (cLow === currentCam);
+
+    let tile = deck.querySelector(`.zone-console-card[data-cam="${CSS.escape(cam.name)}"]`);
+
+    if (tile) {
+      // In-place update existing tile to prevent flicker and preserve zoom/hover state
+      if (isSelected) {
+        tile.classList.add("border-amber-500", "shadow-[0_0_12px_rgba(245,158,11,0.25)]");
+        tile.classList.remove("border-slate-800", "hover:border-slate-700");
+      } else {
+        tile.classList.remove("border-amber-500", "shadow-[0_0_12px_rgba(245,158,11,0.25)]");
+        tile.classList.add("border-slate-800", "hover:border-slate-700");
+      }
+
+      const img = tile.querySelector(".zone-crop-img");
+      if (img) {
+        const nextSrc = `${cam.crop_url}?t=${Date.now()}`;
+        const preloader = new Image();
+        preloader.onload = () => {
+          img.src = preloader.src;
+        };
+        preloader.src = nextSrc;
+      }
+
+      const batEl = tile.querySelector(".zone-battery-badge");
+      if (batEl && cam.battery_percentage !== undefined && cam.battery_percentage !== null) {
+        batEl.textContent = `${cam.battery_percentage}%`;
+      }
+      return;
+    }
+
+    // First time render: Build full card structure
+    tile = document.createElement("div");
+    tile.dataset.cam = cam.name;
+    tile.className = `zone-console-card relative flex flex-col bg-slate-900 border ${isSelected ? "border-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.25)]" : "border-slate-800 hover:border-slate-700"} rounded-xl overflow-hidden transition group min-w-0`;
+
+    let displayName = cam.name;
+    if (displayName.toLowerCase().includes("s21")) displayName = "S21 Ultra";
+    else if (isTab) displayName = "Tab A11+";
+    else if (displayName.toLowerCase().includes("garden")) displayName = "Garden";
+    else if (displayName.toLowerCase().includes("cam1") || displayName.toLowerCase().includes("cam 1")) displayName = "Cam 1";
+    else if (displayName.toLowerCase().includes("local")) displayName = "Local USB";
+
+    if (!tileZoomState[cam.name]) {
+      tileZoomState[cam.name] = { scale: consoleZoneScale, originX: 50, originY: 50 };
+    }
+    const state = tileZoomState[cam.name];
+    const cropUrl = `${cam.crop_url}?t=${Date.now()}`;
+
+    tile.innerHTML = `
+      <!-- Card Header: Razor-aligned, fixed height, bright online LED, battery indicator -->
+      <div class="h-9 px-2.5 bg-slate-950/95 border-b border-slate-800 flex items-center justify-between gap-1.5 select-none">
+        <div class="flex items-center gap-1.5 min-w-0 overflow-hidden">
+          <span class="w-2 h-2 rounded-full flex-shrink-0 bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)] ${isSelected ? "ring-2 ring-amber-400 animate-pulse" : ""}" title="${cam.name} is Online"></span>
+          <span class="text-xs font-semibold text-slate-100 truncate tracking-wide" title="${cam.name}">${displayName}</span>
+          ${(cam.battery_percentage !== undefined && cam.battery_percentage !== null) ? `<span class="zone-battery-badge text-[9px] text-emerald-400/80 font-mono font-bold bg-emerald-950/60 px-1 py-0.2 rounded border border-emerald-800/40">${cam.battery_percentage}%</span>` : ""}
+        </div>
+        <div class="flex-shrink-0">
+          ${cam.has_zone
+            ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
+                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
+              </span>`
+            : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-slate-800/90 text-slate-200 border border-slate-700/60 flex items-center gap-1 whitespace-nowrap">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
+              </span>`
+          }
+        </div>
+      </div>
+
+      <!-- Zoomable Viewport: Centered on mouse pointer -->
+      <div class="relative w-full h-40 bg-black overflow-hidden flex items-center justify-center cursor-crosshair zone-tile-viewport select-none" data-cam="${cam.name}" title="Mouse wheel to zoom in on cursor &bull; Double-click to toggle 2.5x">
+        <img 
+          src="${cropUrl}" 
+          alt="${cam.name} Zone" 
+          class="zone-crop-img max-w-full max-h-full object-contain select-none transition-transform duration-100"
+          style="transform-origin: ${state.originX}% ${state.originY}%; transform: scale(${state.scale});"
+          loading="lazy"
+        />
+
+        <!-- Hover Overlay with Select Button -->
+        <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center pointer-events-none">
+          <button type="button" class="pointer-events-auto px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-xl flex items-center gap-1.5 active:scale-95 transition" onclick="selectActiveCamera('${cam.name}')">
+            <span>📺</span> Select Camera
+          </button>
+        </div>
+
+        <!-- Magnification Watermark Badge -->
+        <div class="zoom-indicator-badge absolute bottom-1.5 right-1.5 bg-black/85 backdrop-blur px-2 py-0.5 rounded-md text-[10px] font-mono text-amber-400 font-bold border border-slate-700 pointer-events-none shadow-md">
+          ${state.scale.toFixed(1)}x
+        </div>
+      </div>
+    `;
+
+    const vp = tile.querySelector(".zone-tile-viewport");
+    if (vp) {
+      vp.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const rect = vp.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        const originX = Math.max(0, Math.min(100, (mouseX / rect.width) * 100));
+        const originY = Math.max(0, Math.min(100, (mouseY / rect.height) * 100));
+
+        const curState = tileZoomState[cam.name] || { scale: consoleZoneScale, originX: 50, originY: 50 };
+        const step = e.deltaY < 0 ? 0.35 : -0.35;
+        const newScale = Math.min(5.0, Math.max(1.0, Math.round((curState.scale + step) * 10) / 10));
+
+        curState.scale = newScale;
+        if (newScale > 1.0) {
+          curState.originX = originX;
+          curState.originY = originY;
+        } else {
+          curState.originX = 50;
+          curState.originY = 50;
+        }
+        tileZoomState[cam.name] = curState;
+
+        const img = vp.querySelector("img");
+        if (img) {
+          img.style.transformOrigin = `${curState.originX}% ${curState.originY}%`;
+          img.style.transform = `scale(${curState.scale})`;
+        }
+
+        const badge = vp.querySelector(".zoom-indicator-badge");
+        if (badge) {
+          badge.textContent = `${curState.scale.toFixed(1)}x`;
+        }
+      }, { passive: false });
+
+      vp.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        const rect = vp.getBoundingClientRect();
+        const originX = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+        const originY = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
+
+        const curState = tileZoomState[cam.name] || { scale: 1.0, originX: 50, originY: 50 };
+        const newScale = (curState.scale > 1.2) ? 1.0 : 2.5;
+
+        curState.scale = newScale;
+        curState.originX = (newScale > 1.0) ? originX : 50;
+        curState.originY = (newScale > 1.0) ? originY : 50;
+        tileZoomState[cam.name] = curState;
+
+        const img = vp.querySelector("img");
+        if (img) {
+          img.style.transformOrigin = `${curState.originX}% ${curState.originY}%`;
+          img.style.transform = `scale(${curState.scale})`;
+        }
+
+        const badge = vp.querySelector(".zoom-indicator-badge");
+        if (badge) {
+          badge.textContent = `${curState.scale.toFixed(1)}x`;
+        }
+      });
+    }
+
+    deck.appendChild(tile);
+  });
+}
+
+function setConsoleZoneZoom(scale) {
+  consoleZoneScale = scale;
+  document.querySelectorAll(".btn-console-zoom").forEach(btn => {
+    const s = parseFloat(btn.dataset.scale);
+    if (Math.abs(s - scale) < 0.05) {
+      btn.className = "btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-bold transition bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow";
+    } else {
+      btn.className = "btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition";
+    }
+  });
+
+  // Apply consistently across all camera tiles in deck
+  document.querySelectorAll(".zone-tile-viewport").forEach(vp => {
+    const camName = vp.dataset.cam;
+    const curState = { scale: scale, originX: 50, originY: 50 };
+    if (camName) tileZoomState[camName] = curState;
+
+    const img = vp.querySelector("img");
+    if (img) {
+      img.style.transformOrigin = "50% 50%";
+      img.style.transform = `scale(${scale})`;
+    }
+
+    const badge = vp.querySelector(".zoom-indicator-badge");
+    if (badge) {
+      badge.textContent = `${scale.toFixed(1)}x`;
+    }
+  });
+}
+
+function resetConsoleZoneZoom() {
+  setConsoleZoneZoom(1.0);
+}
+
+window.setConsoleZoneZoom = setConsoleZoneZoom;
+window.resetConsoleZoneZoom = resetConsoleZoneZoom;
+window.refreshZoneConsole = refreshZoneConsole;
+window.initZoneConsole = initZoneConsole;
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initZoneConsole);
+} else {
+  initZoneConsole();
+}
+
 

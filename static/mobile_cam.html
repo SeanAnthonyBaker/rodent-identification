@@ -100,6 +100,21 @@
     let currentZoom = 1.0;
     let track = null;
     let sentFrameCount = 0;
+    let phoneBatteryPct = null;
+    let isPhoneCharging = false;
+
+    if (typeof navigator.getBattery === "function") {
+      navigator.getBattery().then(bat => {
+        phoneBatteryPct = Math.round(bat.level * 100);
+        isPhoneCharging = bat.charging;
+        bat.addEventListener('levelchange', () => {
+          phoneBatteryPct = Math.round(bat.level * 100);
+        });
+        bat.addEventListener('chargingchange', () => {
+          isPhoneCharging = bat.charging;
+        });
+      }).catch(() => {});
+    }
 
     btnToggleBroadcast.addEventListener("click", toggleBroadcast);
 
@@ -229,7 +244,9 @@
           signal: controller.signal,
           body: JSON.stringify({
             image_base64: b64,
-            device_name: `Samsung Galaxy S21 Ultra (${currentZoom}x)`
+            device_name: `Samsung Galaxy S21 Ultra (${currentZoom}x)`,
+            battery_percentage: phoneBatteryPct,
+            is_charging: isPhoneCharging
           })
         });
         clearTimeout(timeoutId);

@@ -531,8 +531,12 @@ class SamplerEngine:
         while self._running:
             try:
                 # Ring cameras / battery devices check snapshots periodically
-                is_phone = "s21" in self.ring.camera_name.lower() or "phone" in self.ring.camera_name.lower()
-                if not is_phone:
+                is_fast_broadcaster = bool(
+                    self.ring._active_camera
+                    and hasattr(self.ring._active_camera, "broadcaster")
+                    and self.ring._active_camera.broadcaster is not None
+                )
+                if not is_fast_broadcaster:
                     await self.sample_once()
             except Exception as e:
                 logger.error(f"Error during sampling tick: {e}", exc_info=True)

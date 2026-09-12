@@ -77,12 +77,24 @@ sampler_engine.register_subscriber(ws_broadcaster)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: connect Ring and start background 20-second sampler
+    # Startup: connect Ring, start phone, tablet & local camera broadcasters, and start background sampler
     await ring_manager.async_connect()
+    if hasattr(ring_manager, "_phone_cam") and hasattr(ring_manager._phone_cam, "broadcaster"):
+        ring_manager._phone_cam.broadcaster.start()
+    if hasattr(ring_manager, "_tab_cam") and hasattr(ring_manager._tab_cam, "broadcaster"):
+        ring_manager._tab_cam.broadcaster.start()
+    if hasattr(ring_manager, "_local_cam") and hasattr(ring_manager._local_cam, "broadcaster"):
+        ring_manager._local_cam.broadcaster.start()
     sampler_engine.start()
     logger.info(f"Application started. Ring Camera: '{ring_manager.camera_name}' (Battery: {ring_manager.get_battery_level()}%). Background 20-second sampler active.")
     yield
     # Shutdown
+    if hasattr(ring_manager, "_phone_cam") and hasattr(ring_manager._phone_cam, "broadcaster"):
+        ring_manager._phone_cam.broadcaster.stop()
+    if hasattr(ring_manager, "_tab_cam") and hasattr(ring_manager._tab_cam, "broadcaster"):
+        ring_manager._tab_cam.broadcaster.stop()
+    if hasattr(ring_manager, "_local_cam") and hasattr(ring_manager._local_cam, "broadcaster"):
+        ring_manager._local_cam.broadcaster.stop()
     sampler_engine.stop()
     logger.info("Application shutdown.")
 
@@ -149,10 +161,10 @@ async def select_camera(payload: SelectCameraPayload):
     active_zone = inference_client.get_camera_polygon(payload.camera_name)
     inference_client.detection_polygon = active_zone
 
-    is_s21 = any(k in payload.camera_name.lower() for k in ["s21", "phone", "galaxy", "android"])
-    if is_s21:
+    is_fast_cam = any(k in payload.camera_name.lower() for k in ["s21", "tab", "a11", "galaxy tab", "phone", "galaxy", "android", "local"])
+    if is_fast_cam:
         sampler_engine.current_interval_seconds = sampler_engine.active_detection_interval_seconds
-        logger.info(f"⚡ S21 camera selected -> Switched to REAL-TIME continuous analysis ({sampler_engine.active_detection_interval_seconds}s)")
+        logger.info(f"⚡ Fast camera selected ({payload.camera_name}) -> Switched to REAL-TIME continuous analysis ({sampler_engine.active_detection_interval_seconds}s)")
     else:
         sampler_engine.current_interval_seconds = sampler_engine.base_interval_seconds
 
@@ -179,7 +191,7 @@ async def select_camera(payload: SelectCameraPayload):
             "active_camera": ring_manager.camera_name,
             "health": ring_manager.get_health_status(),
             "detection_polygon": active_zone,
-            "is_realtime": is_s21,
+            "is_realtime": is_fast_cam,
             "interval_seconds": sampler_engine.current_interval_seconds
         }
     })
@@ -196,7 +208,9 @@ class CameraZonePayload(BaseModel):
 
 def _normalize_cam_key(name: str) -> str:
     n = name.lower().strip()
-    if any(k in n for k in ["s21", "s1", "phone", "galaxy", "android"]):
+    if any(k in n for k in ["tab", "a11", "galaxy tab", "tablet", "outhouse"]):
+        return "Galaxy Tab A11+"
+    if any(k in n for k in ["s21", "s1", "phone"]):
         return "S21"
     if "garden" in n:
         return "Garden"
@@ -573,7 +587,7 @@ def apply_live_cctv_hud(image_bytes: bytes, camera_name: str, battery_pct: Optio
         cv2.line(img, (w - 14, h - 14), (w - 14 - b_len, h - 14), b_col, 2)
         cv2.line(img, (w - 14, h - 14), (w - 14, h - 14 - b_len), b_col, 2)
 
-        success, encoded = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        success, encoded = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if success:
             return encoded.tobytes()
     except Exception as e:
@@ -585,34 +599,60 @@ def apply_live_cctv_hud(image_bytes: bytes, camera_name: str, battery_pct: Optio
 async def live_camera_stream(camera_name: str):
     """Serves continuous live MJPEG video stream with standard multipart framing for all cameras."""
     target_cam = ring_manager.find_camera(camera_name)
-    from src.ring_client import AndroidPhoneCamera
-    is_phone = isinstance(target_cam, AndroidPhoneCamera)
+    has_broadcaster = target_cam and hasattr(target_cam, "broadcaster") and target_cam.broadcaster is not None
 
-    # For S21 Phone Camera: stream native 30 FPS direct from MjpegStreamBroadcaster
-    if is_phone and target_cam and hasattr(target_cam, "broadcaster"):
+    # For cameras equipped with a live broadcaster (S21, Local Webcam): stream native smooth FPS
+    if has_broadcaster:
         q = target_cam.broadcaster.subscribe()
-        async def phone_broadcaster_stream():
+        async def fast_broadcaster_stream():
             try:
-                first_frame = target_cam.broadcaster.latest_frame
-                if first_frame:
-                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(first_frame)).encode() + b"\r\n\r\n" + first_frame + b"\r\n")
+                real_cam_name = getattr(target_cam, "name", camera_name)
+                first_frame = target_cam.broadcaster.latest_frame or getattr(target_cam, "_last_frame_bytes", None)
+                if not first_frame and hasattr(target_cam, "async_get_snapshot"):
+                    first_frame = await target_cam.async_get_snapshot()
+                if not first_frame:
+                    first_frame = ring_manager.create_standby_frame(f"Connecting {real_cam_name}...", real_cam_name)
+
+                bat = ring_manager.get_battery_level(target_cam) or 100
+                init_hud = apply_live_cctv_hud(first_frame, real_cam_name, bat)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(init_hud)}\r\n\r\n".encode("ascii")
+                    + init_hud
+                    + b"\r\n"
+                )
                 
+                # Smooth broadcast loop capped at ~20 FPS (prevents socket reset & browser decode choke)
+                last_sent = time.time()
                 while True:
                     try:
                         frame = await asyncio.wait_for(q.get(), timeout=1.0)
-                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
                     except asyncio.TimeoutError:
-                        latest = target_cam.broadcaster.latest_frame
-                        if not latest:
-                            latest = ring_manager.create_standby_frame("Connecting S21 Camera...", "S21")
-                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(latest)).encode() + b"\r\n\r\n" + latest + b"\r\n")
-            except (asyncio.CancelledError, GeneratorExit):
+                        frame = target_cam.broadcaster.latest_frame
+                        if not frame:
+                            frame = ring_manager.create_standby_frame(f"{real_cam_name} Reconnecting (Check USB)...", real_cam_name)
+
+                    now = time.time()
+                    if frame and (now - last_sent >= 0.05):
+                        last_sent = now
+                        live_hud = apply_live_cctv_hud(frame, real_cam_name, bat)
+                        yield (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            + f"Content-Length: {len(live_hud)}\r\n\r\n".encode("ascii")
+                            + live_hud
+                            + b"\r\n"
+                        )
+                    else:
+                        await asyncio.sleep(0.01)
+            except (asyncio.CancelledError, GeneratorExit, ConnectionResetError, BrokenPipeError):
                 pass
             finally:
                 target_cam.broadcaster.unsubscribe(q)
 
         return StreamingResponse(
-            phone_broadcaster_stream(),
+            fast_broadcaster_stream(),
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={
                 "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -622,49 +662,57 @@ async def live_camera_stream(camera_name: str):
             }
         )
 
+    async def safe_bg_fetch(cam_name: str):
+        try:
+            await ring_manager.async_fetch_snapshot(camera_name=cam_name)
+        except Exception as e:
+            logger.debug(f"Background snapshot fetch failed for {cam_name}: {e}")
+
     # Frame generator for Ring cameras yielding discrete, complete JPEGs with standard boundary=frame
     async def frame_generator():
-        # 1. Immediately yield cached or standby frame so browser image switches with 0 latency
-        init_frame = ring_manager._snapshot_cache.get(camera_name)
-        if not init_frame and is_phone and hasattr(ring_manager, "_phone_cam"):
-            init_frame = ring_manager._phone_cam._last_frame_bytes
-        if not init_frame:
-            init_frame = ring_manager.create_standby_frame(f"Connecting {camera_name}...", camera_name)
-        
-        bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
-        real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
-        init_hud = apply_live_cctv_hud(init_frame, real_cam_name, bat)
-        yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n"
-               b"Content-Length: " + str(len(init_hud)).encode() + b"\r\n\r\n" + init_hud + b"\r\n")
-
-        # 2. Continuous real-time stream loop
-        last_fetch_time = time.time()
-        while True:
-            now = time.time()
-            interval = 0.04 if is_phone else 2.5
-            if is_phone or (now - last_fetch_time > interval) or camera_name not in ring_manager._snapshot_cache:
-                frame, _, _, _ = await ring_manager.async_fetch_snapshot(camera_name=camera_name)
-                last_fetch_time = now
-            else:
-                frame = ring_manager._snapshot_cache.get(camera_name)
-
-            if not frame and is_phone and hasattr(ring_manager, "_phone_cam"):
-                frame = ring_manager._phone_cam._last_frame_bytes
-
-            if not frame:
-                frame = ring_manager.create_standby_frame(f"Connecting {camera_name}...", camera_name)
-
-            if frame:
-                bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
-                real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
-                live_frame = apply_live_cctv_hud(frame, real_cam_name, bat)
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n"
-                       b"Content-Length: " + str(len(live_frame)).encode() + b"\r\n\r\n" + live_frame + b"\r\n")
+        try:
+            # 1. Immediately yield cached or standby frame so browser image switches with 0 latency
+            init_frame = ring_manager._snapshot_cache.get(camera_name)
+            if not init_frame and is_phone and hasattr(ring_manager, "_phone_cam"):
+                init_frame = ring_manager._phone_cam._last_frame_bytes
+            if not init_frame:
+                init_frame = ring_manager.create_standby_frame(f"Connecting {camera_name}...", camera_name)
             
-            sleep_duration = 0.04 if is_phone else 0.25
-            await asyncio.sleep(sleep_duration)
+            bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
+            real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
+            init_hud = apply_live_cctv_hud(init_frame, real_cam_name, bat)
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + init_hud + b"\r\n")
+
+            # 2. Continuous non-blocking real-time stream loop (10 FPS with live HUD)
+            last_bg_refresh = 0.0
+            while True:
+                frame = ring_manager._snapshot_cache.get(camera_name)
+                if not frame and is_phone and hasattr(ring_manager, "_phone_cam"):
+                    frame = ring_manager._phone_cam._last_frame_bytes
+
+                now = time.time()
+                # If no frame cached, or if 25s elapsed, refresh in background without blocking stream
+                if not frame or (not is_phone and (now - last_bg_refresh > 25.0)):
+                    last_bg_refresh = now
+                    asyncio.create_task(safe_bg_fetch(camera_name))
+
+                if not frame:
+                    frame = ring_manager.create_standby_frame(f"Connecting {camera_name}...", camera_name)
+
+                if frame:
+                    bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
+                    real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
+                    live_frame = apply_live_cctv_hud(frame, real_cam_name, bat)
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + live_frame + b"\r\n")
+
+                sleep_duration = 0.04 if is_phone else 0.1
+                await asyncio.sleep(sleep_duration)
+        except (asyncio.CancelledError, GeneratorExit, ConnectionResetError, BrokenPipeError):
+            logger.debug(f"Client disconnected from stream for {camera_name}")
+            return
+        except Exception as e:
+            logger.error(f"Error in stream generator for {camera_name}: {e}")
+            return
 
     return StreamingResponse(
         frame_generator(),
@@ -690,33 +738,6 @@ async def rotate_s21_camera(orientation: Optional[str] = "landscape"):
 @app.get("/api/camera/live_stream")
 async def live_video_stream():
     """Serves high-frame-rate MJPEG video stream to any web viewer."""
-    target_cam = ring_manager.find_camera("S21") or ring_manager._active_camera
-    from src.ring_client import AndroidPhoneCamera
-    if isinstance(target_cam, AndroidPhoneCamera) and hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
-        q = target_cam.broadcaster.subscribe()
-        async def phone_stream():
-            try:
-                first_frame = target_cam.broadcaster.latest_frame
-                if first_frame:
-                    yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(first_frame)).encode() + b"\r\n\r\n" + first_frame + b"\r\n")
-                while True:
-                    try:
-                        frame = await asyncio.wait_for(q.get(), timeout=1.5)
-                        yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
-                    except asyncio.TimeoutError:
-                        latest = target_cam.broadcaster.latest_frame
-                        if latest:
-                            yield (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(latest)).encode() + b"\r\n\r\n" + latest + b"\r\n")
-            except (asyncio.CancelledError, GeneratorExit):
-                pass
-            finally:
-                target_cam.broadcaster.unsubscribe(q)
-        return StreamingResponse(
-            phone_stream(),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-            headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0", "Connection": "keep-alive"}
-        )
-
     async def frame_generator():
         last_fetch_time = 0.0
         while True:
@@ -747,6 +768,37 @@ class ScreenCamFramePayload(BaseModel):
     image_base64: str
     device_name: Optional[str] = "Screen Cam (Live)"
     polygon: Optional[List[List[float]]] = None
+    battery_percentage: Optional[int] = None
+    is_charging: Optional[bool] = None
+
+class PhoneBatteryReportPayload(BaseModel):
+    battery_percentage: int
+    is_charging: Optional[bool] = None
+    device_name: Optional[str] = "Samsung Galaxy S21 Ultra"
+
+@app.post("/api/camera/{camera_name}/battery")
+@app.post("/api/camera/s21/battery")
+@app.post("/api/phone/battery")
+async def report_phone_battery(camera_name: str = "S21", payload: PhoneBatteryReportPayload = None):
+    """Allows phone app / Shortcut / Tasker / curl to report current battery percentage."""
+    if payload is None:
+        raise HTTPException(status_code=400, detail="Missing payload")
+    cam = ring_manager.find_camera(camera_name)
+    if cam and hasattr(cam, "battery_life"):
+        cam.battery_life = payload.battery_percentage
+        logger.info(f"🔋 S21 Battery reported directly from phone: {payload.battery_percentage}%")
+        return {"success": True, "camera": camera_name, "battery_percentage": payload.battery_percentage}
+    return {"success": False, "error": f"Camera '{camera_name}' not found"}
+
+@app.get("/api/camera/{camera_name}/refresh_battery")
+@app.get("/api/camera/s21/refresh_battery")
+async def refresh_camera_battery(camera_name: str = "S21"):
+    """Actively polls the camera / phone to read hardware battery."""
+    cam = ring_manager.find_camera(camera_name)
+    if cam and hasattr(cam, "refresh_battery_from_phone"):
+        val = await asyncio.to_thread(cam.refresh_battery_from_phone)
+        return {"success": True, "battery_percentage": val}
+    return {"success": False, "error": "Camera does not support dynamic battery refresh"}
 
 _last_stream_ai_time = 0.0
 _is_analyzing_stream = False
@@ -795,6 +847,9 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
     if hasattr(ring_manager, "_phone_cam"):
         ring_manager._phone_cam._last_frame_bytes = image_bytes
         ring_manager._phone_cam._last_frame_time = now_time
+        if payload.battery_percentage is not None:
+            ring_manager._phone_cam.battery_life = payload.battery_percentage
+            logger.info(f"🔋 Updated S21 battery level from live stream telemetry: {payload.battery_percentage}%")
         if ring_manager._active_camera != ring_manager._phone_cam:
             ring_manager._active_camera = ring_manager._phone_cam
             logger.info("Auto-switched active camera to Samsung Galaxy S21 Ultra from live stream.")
@@ -899,8 +954,8 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
                     "data": {
                         "sample_index": sampler_engine._sample_count + 1,
                         "timestamp": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                        "device_health": {"battery_percentage": 95, "device_name": dev_name, "is_mock": False},
-                        "battery_percentage": 95,
+                        "device_health": {"battery_percentage": 50, "device_name": dev_name, "is_mock": False},
+                        "battery_percentage": 50,
                         "detected": res.is_detected,
                         "rat_detected": res.is_detected,
                         "object_type": res.object_type,
@@ -1022,6 +1077,119 @@ async def get_reference_baseline_image():
     if not ref_b:
         raise HTTPException(status_code=404, detail="No reference baseline image found.")
     return Response(content=ref_b, media_type="image/jpeg")
+
+
+def create_placeholder_zone_image(text: str, subtext: str = "") -> bytes:
+    img = np.zeros((360, 480, 3), dtype=np.uint8)
+    img[:] = (18, 22, 30)
+    cv2.rectangle(img, (8, 8), (472, 352), (40, 48, 65), 1)
+    cv2.putText(img, text, (35, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (220, 225, 235), 2, cv2.LINE_AA)
+    if subtext:
+        cv2.putText(img, subtext, (35, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 150, 170), 1, cv2.LINE_AA)
+    ret, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    return enc.tobytes()
+
+
+@app.get("/api/camera/{camera_name}/zone_crop")
+async def get_camera_zone_crop(camera_name: str):
+    """Returns a high-resolution cropped JPEG containing exclusively the drawn target zone for the given camera."""
+    target_cam = ring_manager.find_camera(camera_name)
+    poly = inference_client.get_camera_polygon(camera_name, fallback=False)
+
+    # 1. Fetch current frame for THIS specific camera
+    frame = None
+    if target_cam:
+        if hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
+            target_cam.broadcaster.start()
+            frame = target_cam.broadcaster.latest_frame
+        if not frame and hasattr(target_cam, "latest_frame") and target_cam.latest_frame:
+            frame = target_cam.latest_frame
+        if not frame and hasattr(target_cam, "async_get_snapshot"):
+            try:
+                frame = await target_cam.async_get_snapshot()
+            except Exception:
+                pass
+
+    if not frame:
+        frame = ring_manager._snapshot_cache.get(camera_name)
+        if not frame:
+            for k, v in ring_manager._snapshot_cache.items():
+                if k.lower() == camera_name.lower() or _normalize_cam_key(k) == _normalize_cam_key(camera_name):
+                    frame = v
+                    break
+
+    if not frame and target_cam:
+        try:
+            snap, _, _, _ = await ring_manager.async_fetch_snapshot(camera_name=camera_name)
+            if snap:
+                frame = snap
+        except Exception as e:
+            logger.debug(f"async_fetch_snapshot failed for {camera_name}: {e}")
+
+    no_cache_headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
+
+    if not frame:
+        placeholder = create_placeholder_zone_image(f"{camera_name}", "Standby / No Frame")
+        return Response(content=placeholder, media_type="image/jpeg", headers=no_cache_headers)
+
+    # 2. If NO polygon zone is drawn for this specific camera: show full camera view with guide banner
+    if not poly or len(poly) < 3:
+        try:
+            nparr = np.frombuffer(frame, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is not None:
+                h, w = img.shape[:2]
+                banner_h = max(34, int(h * 0.08))
+                cv2.rectangle(img, (0, 0), (w, banner_h), (15, 23, 42), -1)
+                cv2.putText(img, f"{camera_name}: No Zone Drawn (Click Select to Draw)", (16, int(banner_h * 0.65)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (250, 204, 21), 2, cv2.LINE_AA)
+                success, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+                if success:
+                    return Response(content=enc.tobytes(), media_type="image/jpeg", headers=no_cache_headers)
+        except Exception:
+            pass
+        placeholder = create_placeholder_zone_image(f"{camera_name}", "No Zone Configured")
+        return Response(content=placeholder, media_type="image/jpeg", headers=no_cache_headers)
+
+    # 3. If polygon DOES exist for this camera: extract the exact zone crop using motion pipeline
+    try:
+        crop_bytes, bbox, shape = sampler_engine.motion_pipeline.extract_target_zone_crop(frame, polygon=poly)
+        if crop_bytes:
+            return Response(content=crop_bytes, media_type="image/jpeg", headers=no_cache_headers)
+    except Exception as e:
+        logger.error(f"Error extracting zone crop for {camera_name}: {e}")
+
+    return Response(content=frame, media_type="image/jpeg", headers=no_cache_headers)
+
+
+@app.get("/api/cameras/zone_summary")
+async def get_cameras_zone_summary():
+    """Returns all cameras with active zone configuration, delta scores, and crop endpoints."""
+    cams_info = ring_manager.list_cameras()
+    active_cam_name = ring_manager.camera_name
+    results = []
+    for c in cams_info:
+        cam_name = c["name"]
+        if "outhouse" in cam_name.lower():
+            continue
+        poly = inference_client.get_camera_polygon(cam_name, fallback=False)
+        has_zone = poly is not None and len(poly) >= 3
+        is_sel = (cam_name.lower() == (active_cam_name or "").lower())
+        results.append({
+            "name": cam_name,
+            "has_zone": has_zone,
+            "polygon": poly,
+            "crop_url": f"/api/camera/{cam_name}/zone_crop",
+            "is_active": is_sel,
+            "is_online": True,
+            "battery_percentage": c.get("battery_percentage"),
+            "delta_percent": 0.0
+        })
+    return {"cameras": results, "active_camera": active_cam_name}
 
 
 class BacklogFolderPayload(BaseModel):

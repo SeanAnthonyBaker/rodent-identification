@@ -3,12 +3,15 @@ import io
 import json
 import os
 import subprocess
+import shutil
+import re
 import logging
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List, Set
+import threading
 import cv2
 import httpx
 from PIL import Image, ImageDraw
@@ -16,23 +19,77 @@ from PIL import Image, ImageDraw
 logger = logging.getLogger("ring_client")
 
 
+def ensure_adb_forward(local_port: int = 8085, remote_port: int = 8080, target_serial: Optional[str] = None) -> bool:
+    """Ensures that ADB port forwarding from PC local_port to Android remote_port is actively configured."""
+    adb_path = r"C:\Users\seanb\AppData\Local\Microsoft\WinGet\Packages\Genymobile.scrcpy_Microsoft.Winget.Source_8wekyb3d8bbwe\scrcpy-win64-v3.3.4\adb.exe"
+    if not os.path.exists(adb_path):
+        import shutil
+        adb_path = shutil.which("adb") or adb_path
+    if os.path.exists(adb_path):
+        try:
+            list_res = subprocess.run(
+                [adb_path, "forward", "--list"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=4
+            )
+            if list_res.returncode == 0 and f"tcp:{local_port} tcp:{remote_port}" in list_res.stdout:
+                return True
+
+            fwd_cmd = [adb_path]
+            if target_serial:
+                fwd_cmd.extend(["-s", target_serial])
+            fwd_cmd.extend(["forward", f"tcp:{local_port}", f"tcp:{remote_port}"])
+
+            res = subprocess.run(
+                fwd_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=8
+            )
+            return res.returncode == 0
+        except Exception as e:
+            logger.debug(f"ensure_adb_forward({local_port}) error: {e}")
+    return False
+
+def ensure_adb_forward_8085() -> bool:
+    return ensure_adb_forward(8085, 8080)
+
+def ensure_adb_forward_8086() -> bool:
+    return ensure_adb_forward(8086, 8080, "192.168.1.194:5555")
+
+
 class MjpegStreamBroadcaster:
     """Maintains a single persistent connection to an MJPEG camera stream and broadcasts parsed JPEGs at full 30 FPS."""
-    def __init__(self, stream_url: str):
+    def __init__(
+        self,
+        stream_url: str,
+        adb_port: int = 8085,
+        wifi_candidates: Optional[List[str]] = None,
+        target_device_serial: Optional[str] = None
+    ):
         self.stream_url = stream_url
+        self.adb_port = adb_port
+        self.wifi_candidates = wifi_candidates or ["http://192.168.1.165:8080/video"]
+        self.target_device_serial = target_device_serial
         self._subscribers: Set[asyncio.Queue] = set()
         self._worker_task: Optional[asyncio.Task] = None
         self._latest_frame: Optional[bytes] = None
+        self._last_frame_time: float = 0.0
         self._is_running = False
 
     def start(self):
-        if not self._is_running or not self._worker_task or self._worker_task.done():
-            self._is_running = True
-            try:
-                loop = asyncio.get_running_loop()
+        try:
+            loop = asyncio.get_running_loop()
+            if not self._worker_task or self._worker_task.done():
+                self._is_running = True
                 self._worker_task = loop.create_task(self._stream_loop())
-            except RuntimeError:
-                pass
+        except RuntimeError:
+            self._is_running = False
 
     def stop(self):
         self._is_running = False
@@ -40,8 +97,14 @@ class MjpegStreamBroadcaster:
             self._worker_task.cancel()
 
     @property
+    def is_live(self) -> bool:
+        return (time.time() - self._last_frame_time) < 3.5
+
+    @property
     def latest_frame(self) -> Optional[bytes]:
-        return self._latest_frame
+        if (time.time() - self._last_frame_time) < 3.5:
+            return self._latest_frame
+        return None
 
     def subscribe(self) -> asyncio.Queue:
         q = asyncio.Queue(maxsize=2)
@@ -55,6 +118,9 @@ class MjpegStreamBroadcaster:
     async def _stream_loop(self):
         while self._is_running:
             try:
+                if f"127.0.0.1:{self.adb_port}" in self.stream_url:
+                    await asyncio.to_thread(ensure_adb_forward, self.adb_port, 8080, self.target_device_serial)
+
                 stream_timeout = httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=None)
                 async with httpx.AsyncClient(timeout=stream_timeout) as client:
                     async with client.stream("GET", self.stream_url) as resp:
@@ -103,6 +169,7 @@ class MjpegStreamBroadcaster:
                                     del buffer[:end+2]
                                 
                                 self._latest_frame = jpeg_frame
+                                self._last_frame_time = time.time()
                                 
                                 # Broadcast to all active browser queues
                                 dead_queues = []
@@ -121,19 +188,150 @@ class MjpegStreamBroadcaster:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.debug(f"S21 MJPEG stream broadcaster reconnecting: {e}")
-                await asyncio.sleep(0.2)
+                logger.debug(f"MJPEG stream broadcaster reconnecting ({self.stream_url}): {e}")
+                # Auto-failover between USB/ADB port and Wi-Fi LAN ports
+                if f"127.0.0.1:{self.adb_port}" in self.stream_url:
+                    fwd_ok = await asyncio.to_thread(ensure_adb_forward, self.adb_port, 8080, self.target_device_serial)
+                    if not fwd_ok and self.wifi_candidates:
+                        self.stream_url = self.wifi_candidates[0]
+                elif any(cand in self.stream_url for cand in self.wifi_candidates):
+                    fwd_ok = await asyncio.to_thread(ensure_adb_forward, self.adb_port, 8080, self.target_device_serial)
+                    if fwd_ok:
+                        self.stream_url = f"http://127.0.0.1:{self.adb_port}/video"
+                    elif len(self.wifi_candidates) > 1:
+                        cur_idx = self.wifi_candidates.index(self.stream_url) if self.stream_url in self.wifi_candidates else 0
+                        next_idx = (cur_idx + 1) % len(self.wifi_candidates)
+                        self.stream_url = self.wifi_candidates[next_idx]
+                await asyncio.sleep(0.5)
+
+
+class LocalWebcamBroadcaster:
+    """Maintains a persistent connection to a local USB webcam or Windows Virtual Camera and broadcasts frames at ~25 FPS."""
+    def __init__(self, camera_index: int = 0, backend: Optional[int] = None, strict_index: bool = True):
+        self.camera_index = camera_index
+        self.backend = backend
+        self.strict_index = strict_index
+        self._subscribers: Set[asyncio.Queue] = set()
+        self._thread: Optional[threading.Thread] = None
+        self._latest_frame: Optional[bytes] = None
+        self._is_running = False
+        self._lock = threading.Lock()
+
+    def start(self):
+        if not self._is_running or not self._thread or not self._thread.is_alive():
+            self._is_running = True
+            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._is_running = False
+
+    @property
+    def latest_frame(self) -> Optional[bytes]:
+        with self._lock:
+            return self._latest_frame
+
+    def subscribe(self) -> asyncio.Queue:
+        q = asyncio.Queue(maxsize=2)
+        self._subscribers.add(q)
+        self.start()
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self._subscribers.discard(q)
+
+    def _capture_loop(self):
+        backends = [self.backend] if self.backend is not None else ([cv2.CAP_MSMF, cv2.CAP_DSHOW] if self.camera_index in (1, 2) else [cv2.CAP_DSHOW, cv2.CAP_MSMF])
+        indices = [self.camera_index] if self.strict_index else [self.camera_index] + [i for i in [2, 1, 0] if i != self.camera_index]
+
+        while self._is_running:
+            cap = None
+            try:
+                for b in backends:
+                    for idx in indices:
+                        try:
+                            temp_cap = cv2.VideoCapture(idx, b)
+                            if temp_cap.isOpened():
+                                ret, test_f = temp_cap.read()
+                                if ret and test_f is not None:
+                                    cap = temp_cap
+                                    self.camera_index = idx
+                                    self.backend = b
+                                    break
+                            temp_cap.release()
+                        except Exception:
+                            pass
+                    if cap and cap.isOpened():
+                        break
+
+                if not cap or not cap.isOpened():
+                    time.sleep(1.0)
+                    continue
+
+                logger.info(f"LocalWebcamBroadcaster active on camera index {self.camera_index} (backend: {self.backend})")
+                consecutive_failures = 0
+                while self._is_running:
+                    ret, frame = cap.read()
+                    if not ret or frame is None or frame.size == 0:
+                        consecutive_failures += 1
+                        if consecutive_failures > 50:
+                            logger.debug(f"Broadcaster on camera index {self.camera_index} experienced read timeout, reconnecting...")
+                            break
+                        time.sleep(0.04)
+                        continue
+                    consecutive_failures = 0
+
+                    success, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    if not success:
+                        continue
+
+                    jpeg_bytes = enc.tobytes()
+                    with self._lock:
+                        self._latest_frame = jpeg_bytes
+
+                    dead_queues = []
+                    for q in list(self._subscribers):
+                        try:
+                            if q.full():
+                                try:
+                                    q.get_nowait()
+                                except Exception:
+                                    pass
+                            q.put_nowait(jpeg_bytes)
+                        except Exception:
+                            dead_queues.append(q)
+                    for dq in dead_queues:
+                        self._subscribers.discard(dq)
+
+                    time.sleep(0.04)
+            except Exception as e:
+                logger.debug(f"LocalWebcamBroadcaster loop error: {e}")
+                time.sleep(1.0)
+            finally:
+                if cap:
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
 
 
 class LocalRolandCamera:
     """Captures live frames directly from the webcam/camera attached to Roland 1."""
-    def __init__(self, name: str = "Local Camera (Roland 1)", camera_index: int = 1):
+    def __init__(self, name: str = "Local Camera (Roland 1)", camera_index: int = 0, backend: Optional[int] = None):
         self.name = name
         self.device_id = f"local-roland-cam-{camera_index}"
         self.family = "local_cameras"
         self.model = "Roland 1 Direct Camera (USB/Webcam)"
         self.camera_index = camera_index
         self._battery_level = 100
+        self.broadcaster = LocalWebcamBroadcaster(camera_index=camera_index, backend=backend, strict_index=True)
+        self.broadcaster.start()
+
+    @property
+    def latest_frame(self) -> Optional[bytes]:
+        if self.broadcaster and self.broadcaster.latest_frame:
+            return self.broadcaster.latest_frame
+        return None
 
     @property
     def battery_life(self) -> int:
@@ -156,72 +354,137 @@ class LocalRolandCamera:
 
     async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
         """Captures an instant real-time frame directly from Roland 1's camera."""
-        def _capture():
-            # Try specified camera_index first, then fallback across 1, 0
-            indices = [self.camera_index] + [i for i in [1, 0] if i != self.camera_index]
-            for idx in indices:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(idx)
-                if not cap.isOpened():
-                    continue
-                ret, frame = cap.read()
-                cap.release()
-                if ret and frame is not None and frame.size > 0:
-                    # Check if frame is not completely pitch black
-                    if frame.mean() > 5.0:
-                        success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        if success:
-                            return encoded.tobytes()
-            # If no non-black frame, try the first working cap
-            for idx in indices:
-                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret and frame is not None:
-                        success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        if success:
-                            return encoded.tobytes()
-            return None
+        if self.broadcaster:
+            self.broadcaster.start()
+            if self.broadcaster.latest_frame:
+                return self.broadcaster.latest_frame
+            for _ in range(5):
+                await asyncio.sleep(0.05)
+                if self.broadcaster.latest_frame:
+                    return self.broadcaster.latest_frame
+        return None
 
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _capture)
+
+class GalaxyTabWindowsCamera(LocalRolandCamera):
+    """Ingests live stream from Samsung Galaxy Tab A11+ via Windows Link (Connected Camera)."""
+    def __init__(self, name: str = "Galaxy Tab A11+", camera_index: int = 2):
+        super().__init__(name=name, camera_index=camera_index, backend=cv2.CAP_DSHOW)
+        self.device_id = "tablet-cam-tab-a11"
+        self.family = "tablet_cameras"
+        self.model = "Samsung Galaxy Tab A11+ (Windows Link / Connected Camera)"
+        self._battery_level = 80
+
+    @property
+    def battery_life(self) -> int:
+        return self._battery_level
+
+    @property
+    def wifi_signal_strength(self) -> int:
+        return -40
+
+    def get_health(self) -> Dict[str, Any]:
+        return {
+            "battery_percentage": self._battery_level,
+            "battery_percentage_category": "good",
+            "wifi_signal_strength": -40,
+            "device_name": self.name,
+            "device_id": self.device_id,
+            "is_mock": False,
+            "is_phone": True,
+            "is_local": True,
+            "is_windows_link": True
+        }
+
+    async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
+        """Captures an instant real-time frame directly from Windows Link Virtual Camera."""
+        if self.broadcaster:
+            self.broadcaster.start()
+            if self.broadcaster.latest_frame:
+                return self.broadcaster.latest_frame
+            for _ in range(8):
+                await asyncio.sleep(0.05)
+                if self.broadcaster.latest_frame:
+                    return self.broadcaster.latest_frame
+        return None
 
 
 class AndroidPhoneCamera:
-    """Ingests live stream from Samsung Galaxy S21 Ultra via Webcam, IP Stream, or Browser."""
-    def __init__(self, name: str = "Samsung Galaxy S21 Ultra", stream_url: Optional[str] = None, camera_index: int = 1):
+    """Ingests live stream from Android device (S21 Ultra, Galaxy Tab A11+, etc.) via Webcam, IP Stream, or Browser."""
+    def __init__(
+        self,
+        name: str = "Samsung Galaxy S21 Ultra",
+        stream_url: Optional[str] = None,
+        camera_index: int = 1,
+        device_id: str = "phone-cam-s21-ultra",
+        model: str = "Samsung Galaxy S21 Ultra (Webcam / Wireless Stream)",
+        adb_port: int = 8085,
+        target_device_serial: Optional[str] = None,
+        wifi_candidates: Optional[List[str]] = None
+    ):
         self.name = name
-        self.device_id = "phone-cam-s21-ultra"
+        self.device_id = device_id
         self.family = "phone_cameras"
-        self.model = "Samsung Galaxy S21 Ultra (Webcam / Wireless Stream)"
-        
-        # Check if USB ADB physical wire is connected to Roland 1
-        usb_url = self._check_and_setup_usb_forward()
-        self.stream_url = usb_url or stream_url or "http://192.168.1.165:8080/video"
-        
+        self.model = model
         self.camera_index = camera_index
+        self.adb_port = adb_port
+        self.target_device_serial = target_device_serial
+        self.wifi_candidates = wifi_candidates or ["http://192.168.1.165:8080/video"]
+        
+        # Dynamically probe and select active working endpoint (USB/ADB or Wi-Fi)
+        self.stream_url = self._resolve_active_stream_url(stream_url)
+        
+        self._battery_level: int = 80
         self._last_frame_bytes: Optional[bytes] = None
         self._last_frame_time: float = 0.0
         self._client: Optional[httpx.AsyncClient] = None
         self._orientation_initialized: bool = False
-        self.broadcaster = MjpegStreamBroadcaster(self.stream_url)
+        self.broadcaster = MjpegStreamBroadcaster(
+            self.stream_url,
+            adb_port=self.adb_port,
+            wifi_candidates=self.wifi_candidates,
+            target_device_serial=self.target_device_serial
+        )
         self.broadcaster.start()
+        self._poll_thread = threading.Thread(target=self._battery_poll_loop, daemon=True)
+        self._poll_thread.start()
+
+    def _resolve_active_stream_url(self, explicit_url: Optional[str] = None) -> str:
+        """Fast-probes USB and Wi-Fi to select whichever endpoint is actively responding."""
+        if explicit_url:
+            return explicit_url
+
+        # 1. Prioritize USB direct cable connection
+        usb_url = self._check_and_setup_usb_forward()
+        if usb_url:
+            return usb_url
+
+        import socket
+        def _is_port_open(host: str, port: int, timeout: float = 0.15) -> bool:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(timeout)
+                    s.connect((host, port))
+                    return True
+            except Exception:
+                return False
+
+        # 2. Fast probe Wi-Fi candidates
+        for cand in self.wifi_candidates:
+            try:
+                base = cand.replace("http://", "").replace("https://", "").split("/")[0]
+                host, port_s = base.split(":")
+                if _is_port_open(host, int(port_s), timeout=0.15):
+                    logger.info(f"⚡ {self.name} actively connected via Wi-Fi ({cand})!")
+                    return cand
+            except Exception:
+                pass
+
+        return f"http://127.0.0.1:{self.adb_port}/video"
 
     def _check_and_setup_usb_forward(self) -> Optional[str]:
-        adb_path = r"C:\Users\seanb\AppData\Local\Microsoft\WinGet\Packages\Genymobile.scrcpy_Microsoft.Winget.Source_8wekyb3d8bbwe\scrcpy-win64-v3.3.4\adb.exe"
-        if os.path.exists(adb_path):
-            try:
-                import subprocess
-                devs = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=2).stdout
-                if "device\n" in devs or "\tdevice" in devs:
-                    res = subprocess.run([adb_path, "forward", "tcp:8085", "tcp:8080"], capture_output=True, text=True, timeout=2)
-                    if res.returncode == 0:
-                        logger.info("⚡ S21 Ultra connected via direct high-speed USB cable (http://127.0.0.1:8085)!")
-                        return "http://127.0.0.1:8085/video"
-            except Exception as e:
-                logger.debug(f"ADB USB forward check: {e}")
+        if ensure_adb_forward(self.adb_port, 8080, self.target_device_serial):
+            logger.info(f"⚡ {self.name} actively connected via ADB forward (http://127.0.0.1:{self.adb_port})!")
+            return f"http://127.0.0.1:{self.adb_port}/video"
         return None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -230,21 +493,155 @@ class AndroidPhoneCamera:
         return self._client
 
     async def async_set_orientation(self, orientation: str = "landscape"):
-        """Sets hardware camera orientation on S21 phone ('landscape' = 90 deg clockwise) and sets quality for 30 FPS."""
+        """Sets hardware camera orientation on phone/tablet and sets quality for 30 FPS."""
         if self.stream_url:
             base_url = self.stream_url.split("/video")[0].split("/shot.jpg")[0]
             try:
                 client = self._get_client()
                 await client.get(f"{base_url}/settings/orientation?set={orientation}", timeout=2.0)
-                logger.info(f"S21 phone camera orientation set to '{orientation}' (90 deg to the right)")
+                logger.info(f"{self.name} camera orientation set to '{orientation}'")
                 await client.get(f"{base_url}/settings/quality?set=35", timeout=2.0)
-                logger.info("S21 phone camera stream quality set to 35% for low-latency 30 FPS bandwidth")
+                logger.info(f"{self.name} camera stream quality set to 35% for low-latency 30 FPS bandwidth")
             except Exception as e:
-                logger.debug(f"Error configuring phone camera settings: {e}")
+                logger.debug(f"Error configuring camera settings for {self.name}: {e}")
+
+    def read_battery_from_adb(self) -> Optional[int]:
+        """Reads hardware battery percentage directly via ADB dumpsys."""
+        adb = r"C:\Users\seanb\AppData\Local\Microsoft\WinGet\Packages\Genymobile.scrcpy_Microsoft.Winget.Source_8wekyb3d8bbwe\scrcpy-win64-v3.3.4\adb.exe"
+        if not os.path.exists(adb):
+            adb = shutil.which("adb") or adb
+        if not os.path.exists(adb):
+            return None
+
+        try:
+            res = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=1.0)
+            devs = []
+            for line in res.stdout.strip().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == "device":
+                    devs.append(parts[0])
+
+            # Auto-connect wireless ADB IP only if port is open
+            if not devs and self.target_device_serial and ":" in self.target_device_serial:
+                import socket
+                try:
+                    h, p = self.target_device_serial.split(":")
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.06)
+                        if s.connect_ex((h, int(p))) == 0:
+                            subprocess.run([adb, "connect", self.target_device_serial], capture_output=True, text=True, timeout=1.0)
+                except Exception:
+                    pass
+                res2 = subprocess.run([adb, "devices"], capture_output=True, text=True, timeout=1.0)
+                for line in res2.stdout.strip().splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == "device":
+                        devs.append(parts[0])
+
+            if self.target_device_serial:
+                if self.target_device_serial in devs:
+                    devs = [self.target_device_serial]
+                else:
+                    return None
+            else:
+                devs = [d for d in devs if "192.168.1.194" not in d]
+
+            for dev in devs:
+                b_res = subprocess.run([adb, "-s", dev, "shell", "dumpsys", "battery"], capture_output=True, text=True, timeout=1.5)
+                if b_res.returncode == 0:
+                    m = re.search(r"level:\s*(\d+)", b_res.stdout)
+                    if m:
+                        val = int(m.group(1))
+                        logger.info(f"🔋 Successfully read {self.name} battery level via ADB ({dev}): {val}%")
+                        return val
+        except Exception as e:
+            logger.debug(f"read_battery_from_adb error for {self.name}: {e}")
+        return None
+
+    def read_battery_from_http(self) -> Optional[int]:
+        """Queries camera stream endpoints (IP Webcam / broadcaster) for battery telemetry with fast socket pre-checks."""
+        candidates = []
+        if self.stream_url and self.stream_url.startswith("http"):
+            parts = self.stream_url.split("/")
+            if len(parts) >= 3:
+                candidates.append(f"{parts[0]}//{parts[2]}")
+        adb_endpoint = f"http://127.0.0.1:{self.adb_port}"
+        if adb_endpoint not in candidates:
+            candidates.append(adb_endpoint)
+        for u in self.wifi_candidates:
+            parts = u.split("/")
+            if len(parts) >= 3:
+                base = f"{parts[0]}//{parts[2]}"
+                if base not in candidates:
+                    candidates.append(base)
+
+        import socket
+        for base in candidates:
+            # 60ms socket guard before attempting HTTP GET
+            try:
+                hp = base.replace("http://", "").replace("https://", "")
+                if ":" in hp:
+                    host, port_s = hp.split(":")
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.06)
+                        if s.connect_ex((host, int(port_s))) != 0:
+                            continue
+            except Exception:
+                continue
+
+            for ep in ["/status.json", "/battery.json", "/sensors.json"]:
+                try:
+                    resp = httpx.get(f"{base}{ep}", timeout=0.6)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, dict):
+                            for k in ["battery", "cur_battery", "battery_level", "level", "battery_pct"]:
+                                if k in data and data[k] is not None:
+                                    val = int(data[k])
+                                    logger.info(f"🔋 Successfully read {self.name} battery level via HTTP ({base}{ep}): {val}%")
+                                    return val
+                            if "battery" in data and isinstance(data["battery"], dict):
+                                val = data["battery"].get("val") or data["battery"].get("level")
+                                if val is not None:
+                                    val = int(val)
+                                    logger.info(f"🔋 Successfully read {self.name} battery level via HTTP sensor: {val}%")
+                                    return val
+                except Exception:
+                    continue
+        return None
+
+    def refresh_battery_from_phone(self) -> int:
+        """Dynamically polls the device to read battery, caching the latest reading."""
+        # 1. Try ADB (direct hardware OS telemetry)
+        adb_val = self.read_battery_from_adb()
+        if adb_val is not None:
+            self._battery_level = adb_val
+            return adb_val
+
+        # 2. Try HTTP (IP Webcam / broadcaster)
+        http_val = self.read_battery_from_http()
+        if http_val is not None:
+            self._battery_level = http_val
+            return http_val
+
+        return self._battery_level
+
+    def _battery_poll_loop(self):
+        """Background daemon thread checking device battery every 20 seconds."""
+        while True:
+            try:
+                self.refresh_battery_from_phone()
+            except Exception:
+                pass
+            time.sleep(20)
 
     @property
     def battery_life(self) -> int:
-        return 95
+        return self._battery_level
+
+    @battery_life.setter
+    def battery_life(self, val: int):
+        self._battery_level = val
 
     @property
     def wifi_signal_strength(self) -> int:
@@ -252,8 +649,8 @@ class AndroidPhoneCamera:
 
     def get_health(self) -> Dict[str, Any]:
         return {
-            "battery_percentage": 95,
-            "battery_percentage_category": "good",
+            "battery_percentage": self._battery_level,
+            "battery_percentage_category": "good" if self._battery_level > 20 else "low",
             "wifi_signal_strength": -45,
             "device_name": self.name,
             "device_id": self.device_id,
@@ -262,69 +659,76 @@ class AndroidPhoneCamera:
             "stream_url": self.stream_url
         }
 
+    def _generate_standby_frame(self) -> bytes:
+        img = Image.new("RGB", (1280, 720), color=(15, 23, 42))
+        draw = ImageDraw.Draw(img)
+        # Background subtle grid lines
+        for y in range(0, 720, 40):
+            draw.line([(0, y), (1280, y)], fill=(30, 41, 59), width=1)
+        for x in range(0, 1280, 40):
+            draw.line([(x, 0), (x, 720)], fill=(30, 41, 59), width=1)
+        
+        now = datetime.now()
+        timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        draw.rectangle([0, 0, 1280, 52], fill=(2, 6, 23, 230))
+        draw.text((24, 16), f"CAMERA FEED: {self.name.upper()} | STANDBY", fill=(251, 191, 36))
+        draw.text((950, 16), timestamp_str, fill=(148, 163, 184))
+        
+        draw.text((380, 310), f"{self.name} (IP Webcam)", fill=(241, 245, 249))
+        primary_link = self.wifi_candidates[0] if self.wifi_candidates else f"http://127.0.0.1:{self.adb_port}"
+        draw.text((320, 350), f"Listening on http://127.0.0.1:{self.adb_port} / {primary_link}", fill=(148, 163, 184))
+        draw.text((350, 390), "Launch IP Webcam app on device to begin live stream", fill=(100, 116, 139))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
     async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
-        """Fetches a snapshot from S21 Ultra via Browser stream, IP Webcam HTTP stream, or USB Webcam."""
+        """Fetches fresh snapshot from device via Broadcaster buffer, direct HTTP shot, or standby card."""
         if not self._orientation_initialized and self.stream_url:
             self._orientation_initialized = True
             asyncio.create_task(self.async_set_orientation("landscape"))
 
         # 0. Broadcaster 30 FPS buffer (Real-time Instant Snapshot)
-        if hasattr(self, "broadcaster") and self.broadcaster.latest_frame:
-            return self.broadcaster.latest_frame
+        if hasattr(self, "broadcaster") and self.broadcaster:
+            self.broadcaster.start()
+            if self.broadcaster.latest_frame:
+                return self.broadcaster.latest_frame
 
-        # 1. PRIORITY 1: Use live frame uploaded via /mobile_cam browser stream!
-        if self._last_frame_bytes and (time.time() - self._last_frame_time < 60.0):
-            return self._last_frame_bytes
-
-        # 2. PRIORITY 2: Try direct HTTP snapshot endpoint (IP Webcam app: /shot.jpg)
+        # 1. PRIORITY 1: Direct HTTP snapshot fetch with active endpoint prioritization
+        candidate_urls = [f"http://127.0.0.1:{self.adb_port}/shot.jpg"]
+        for w in self.wifi_candidates:
+            w_shot = w.replace("/video", "/shot.jpg")
+            if w_shot not in candidate_urls:
+                candidate_urls.append(w_shot)
         if self.stream_url:
-            shot_url = self.stream_url.replace("/video", "/shot.jpg")
-            try:
-                client = self._get_client()
-                resp = await client.get(shot_url)
-                if resp.status_code == 200 and len(resp.content) > 1000:
-                    self._last_frame_bytes = resp.content
-                    self._last_frame_time = time.time()
-                    return resp.content
-            except Exception:
-                pass
+            active_shot = self.stream_url.replace("/video", "/shot.jpg")
+            if active_shot in candidate_urls:
+                candidate_urls.remove(active_shot)
+            candidate_urls.insert(0, active_shot)
 
-            # Try OpenCV RTSP / MJPEG capture
-            def _capture_url():
+        async with httpx.AsyncClient(timeout=1.2) as client:
+            for shot_url in candidate_urls:
                 try:
-                    cap = cv2.VideoCapture(self.stream_url)
-                    if not cap.isOpened():
-                        return None
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret and frame is not None:
-                        success, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
-                        if success:
-                            return encoded.tobytes()
-                except Exception as e:
-                    logger.debug(f"OpenCV phone stream capture error: {e}")
-                return None
+                    resp = await client.get(shot_url)
+                    if resp.status_code == 200 and len(resp.content) > 1000:
+                        self._last_frame_bytes = resp.content
+                        self._last_frame_time = time.time()
+                        working_stream = shot_url.replace("/shot.jpg", "/video")
+                        if working_stream != self.stream_url:
+                            logger.info(f"⚡ {self.name} stream auto-switched to active link: {working_stream}")
+                            self.stream_url = working_stream
+                            if hasattr(self, "broadcaster") and self.broadcaster:
+                                self.broadcaster.stream_url = working_stream
+                        return resp.content
+                except Exception:
+                    continue
 
-            loop = asyncio.get_event_loop()
-            res = await loop.run_in_executor(None, _capture_url)
-            if res:
-                self._last_frame_bytes = res
-                self._last_frame_time = time.time()
-                return res
-
-        # 3. PRIORITY 3: Check if frame cached
+        # 2. PRIORITY 2: Fallback to last known frame if live fetch temporarily failed
         if self._last_frame_bytes:
             return self._last_frame_bytes
 
-        # 4. Fallback to DirectShow webcam
-        def _capture_webcam():
-            # Return cached frame or None cleanly if no physical webcam is present
-            if self._last_frame_bytes:
-                return self._last_frame_bytes
-            return None
-
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _capture_webcam)
+        # 3. PRIORITY 3: Clean standby display card
+        return self._generate_standby_frame()
 
 
 class MockRingCamera:
@@ -377,17 +781,29 @@ class RingManager:
 
     def __init__(self, token_file: str = "ring_token.json", device_name: Optional[str] = None, mock_fallback: bool = True):
         self.token_file = Path(token_file)
-        self.device_name = device_name or "Samsung Galaxy S21 Ultra"
+        self.device_name = device_name or "Garden"
         self.mock_fallback = mock_fallback
         self._auth = None
         self._ring = None
+        self._active_camera = None
         self._all_cameras = []
         self._is_mock = False
         self._local_cam = LocalRolandCamera("Local Camera (Roland 1)", 0)
         from src.config import config
-        phone_url = getattr(config.ring, "phone_camera_url", "http://192.168.1.165:8080/video")
-        self._phone_cam = AndroidPhoneCamera("Samsung Galaxy S21 Ultra", stream_url=phone_url)
-        self._active_camera = self._phone_cam
+        phone_url = getattr(config.ring, "phone_camera_url", "http://192.168.1.150:8080/video")
+        self._phone_cam = AndroidPhoneCamera(
+            name="Samsung Galaxy S21 Ultra",
+            device_id="phone-cam-s21-ultra",
+            model="Samsung Galaxy S21 Ultra (Webcam / Wireless Stream)",
+            adb_port=8085,
+            wifi_candidates=["http://192.168.1.165:8080/video", "http://192.168.1.150:8080/video"],
+            stream_url=phone_url
+        )
+        self._tab_cam = GalaxyTabWindowsCamera(
+            name="Galaxy Tab A11+",
+            camera_index=2
+        )
+        self._all_cameras = [self._local_cam, self._phone_cam, self._tab_cam]
         self._snapshot_cache: Dict[str, bytes] = {}
         self._last_event_ids: Dict[str, str] = {}
         self._last_vod_trigger_times: Dict[str, float] = {}
@@ -416,13 +832,12 @@ class RingManager:
             logger.error(f"Failed saving updated Ring token: {e}")
 
     async def async_connect(self):
-        """Connects to Ring API and prioritizes Samsung Galaxy S21 Ultra streaming."""
-        self._all_cameras = [self._phone_cam, self._local_cam]
+        """Connects to Ring API and prioritizes Garden and cam1 while filtering out Outhouse."""
+        self._all_cameras = [self._local_cam, self._phone_cam, self._tab_cam]
 
         if not self.token_file.exists():
-            logger.info("Defaulting to Samsung Galaxy S21 Ultra real-time streaming.")
+            logger.warning(f"Ring token file '{self.token_file}' not found. Defaulting to S21 Ultra.")
             self._active_camera = self._phone_cam
-            self.device_name = self._phone_cam.name
             return
 
         try:
@@ -437,46 +852,51 @@ class RingManager:
             devices = self._ring.devices()
             ring_cams = list(devices.stickup_cams) + list(devices.doorbells)
 
+            # Filter out Outhouse device completely (replaced by Galaxy Tab A11+)
+            ring_cams = [c for c in ring_cams if "outhouse" not in getattr(c, "name", "").lower()]
+
             # Sort Ring cameras so Garden and cam1 are first
             def _sort_key(c):
                 name = getattr(c, "name", "").lower()
                 if "garden" in name: return 0
                 if "cam1" in name or "cam 1" in name: return 1
-                if "outhouse" in name: return 2
-                return 3
+                return 2
 
             ring_cams.sort(key=_sort_key)
 
-            # Combine Ring cameras (first) with Local Roland 1 Camera and Phone Camera
-            self._all_cameras = ring_cams + [self._local_cam, self._phone_cam]
+            # Combine Ring cameras (first) with Local Roland 1 Camera, S21 Ultra, and Galaxy Tab A11+
+            self._all_cameras = ring_cams + [self._local_cam, self._phone_cam, self._tab_cam]
 
             # Match active camera
             if self.device_name:
-                matched = next((c for c in self._all_cameras if c.name.lower() == self.device_name.lower()), None)
-                self._active_camera = matched or ring_cams[0] if ring_cams else self._all_cameras[0]
+                matched = self.find_camera(self.device_name)
+                self._active_camera = matched or (ring_cams[0] if ring_cams else self._all_cameras[0])
             else:
                 self._active_camera = ring_cams[0] if ring_cams else self._all_cameras[0]
 
             self._is_mock = False
-            logger.info(f"Connected to Ring API. Discovered {len(ring_cams)} Ring devices: {[c.name for c in ring_cams]}. Active: '{self.camera_name}'")
+            logger.info(f"Connected to Ring API. Discovered {len(ring_cams)} Ring devices: {[c.name for c in ring_cams]}. Total cameras: {[c.name for c in self._all_cameras]}. Active: '{self.camera_name}'")
 
         except Exception as e:
             logger.error(f"Error connecting to Ring API: {e}", exc_info=True)
-            self._active_camera = self._local_cam
+            self._active_camera = self._phone_cam
 
     def list_cameras(self) -> List[Dict[str, Any]]:
-        """Returns all available cameras (Ring Garden, cam1, Outhouse + Local/Phone)."""
+        """Returns all available cameras (Ring Garden, cam1, Galaxy Tab A11+, S21 Ultra, Local Roland)."""
         results = []
         for cam in self._all_cameras:
+            name = getattr(cam, "name", "Camera")
+            if "outhouse" in name.lower():
+                continue
             is_local = isinstance(cam, LocalRolandCamera)
             is_phone = isinstance(cam, AndroidPhoneCamera)
             is_ring = not is_local and not is_phone and not self._is_mock
             bat = getattr(cam, "battery_life", None)
             if is_local: bat = 100
-            elif is_phone: bat = 95
+            elif is_phone: bat = getattr(cam, "battery_life", 80)
             
             results.append({
-                "name": getattr(cam, "name", "Camera"),
+                "name": name,
                 "id": getattr(cam, "id", None) or getattr(cam, "device_id", None),
                 "model": getattr(cam, "model", "Stick Up Cam" if is_ring else "Camera"),
                 "battery_percentage": int(bat) if bat is not None else None,
@@ -489,26 +909,25 @@ class RingManager:
         return results
 
     def find_camera(self, camera_name: Optional[str]) -> Optional[Any]:
-        """Resolves a camera object by direct name or common aliases (Garden, Cam1, S21, S1, Phone)."""
+        """Resolves a camera object by direct name or common aliases (Garden, Cam1, S21, Tab, Outhouse)."""
         if not camera_name:
             return self._active_camera
         c_low = camera_name.lower().strip()
         matched = next((c for c in self._all_cameras if c.name.lower() == c_low), None)
         if matched:
             return matched
-        if any(k in c_low for k in ["s21", "s1", "phone", "galaxy", "android"]):
+        # Alias Outhouse and Tab queries to Galaxy Tab A11+
+        if any(k in c_low for k in ["tab", "a11", "galaxy tab", "tablet", "outhouse"]):
+            return getattr(self, "_tab_cam", None)
+        if any(k in c_low for k in ["s21", "s1", "phone"]):
             return getattr(self, "_phone_cam", None)
         if "garden" in c_low:
-            matched = next((c for c in self._all_cameras if "garden" in c.name.lower()), None)
-            if matched:
-                return matched
-            return getattr(self, "_phone_cam", None)
+            return next((c for c in self._all_cameras if "garden" in c.name.lower()), None)
         if "cam1" in c_low or "cam 1" in c_low:
-            matched = next((c for c in self._all_cameras if "cam1" in c.name.lower() or "cam 1" in c.name.lower()), None)
-            if matched:
-                return matched
-            return getattr(self, "_phone_cam", None)
-        return self._active_camera or getattr(self, "_phone_cam", None)
+            return next((c for c in self._all_cameras if "cam1" in c.name.lower() or "cam 1" in c.name.lower()), None)
+        if any(k in c_low for k in ["local", "roland", "usb", "webcam"]):
+            return getattr(self, "_local_cam", None)
+        return None
 
     def select_camera(self, camera_name: str) -> bool:
         """Switches active camera to the specified camera name."""
@@ -538,7 +957,7 @@ class RingManager:
         if isinstance(cam, LocalRolandCamera):
             return 100
         if isinstance(cam, AndroidPhoneCamera):
-            return 95
+            return getattr(cam, "battery_life", 50)
         try:
             bat = getattr(cam, "battery_life", None)
             if bat is not None:
@@ -722,7 +1141,11 @@ class RingManager:
                     if camera_name:
                         self._snapshot_cache[camera_name] = snap
                     if isinstance(target_cam, AndroidPhoneCamera):
-                        self._snapshot_cache["S21"] = snap
+                        if "s21" in cam_name.lower():
+                            self._snapshot_cache["S21"] = snap
+                        elif any(k in cam_name.lower() for k in ["tab", "a11"]):
+                            self._snapshot_cache["Galaxy Tab A11+"] = snap
+                            self._snapshot_cache["Tab A11+"] = snap
                     return snap, None, False, True
                 return None, f"Could not open stream for {target_cam.name}", False, False
 

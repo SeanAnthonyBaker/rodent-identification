@@ -64,37 +64,48 @@
   <!-- Main Container -->
   <main class="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
 
-    <!-- TOP STATUS ROW: Cards 1, 2, 3 removed; Device Power Level at Slot 4 -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-      
-      <!-- Position 4: Active Device Power Level -->
-      <div id="cardDevicePower" class="lg:col-start-4 bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl flex flex-col justify-between transition hover:border-slate-700">
-        <div class="flex items-center justify-between mb-2">
-          <div class="flex items-center gap-2 font-bold text-slate-100 text-sm">
-            <span id="activePowerIcon">🔋</span>
-            <span id="activePowerDeviceName">Device Power Level</span>
+
+        <!-- SECTION: MULTI-CAMERA TARGET ZONE CONSOLE (SYNCHRONIZED SINGLE-FRAME DECK) -->
+    <section id="zoneConsoleSection" class="bg-slate-900 border border-slate-800 rounded-3xl p-5 shadow-2xl space-y-4">
+      <!-- Console Header & Master Zoom Controls -->
+      <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+        <div>
+          <div class="flex items-center gap-2">
+            <h2 class="text-lg font-bold text-white flex items-center gap-2">
+              <span>🎯</span> Multi-Camera Target Zone Console
+            </h2>
+            <span class="text-xs bg-amber-500/10 text-amber-400 border border-amber-500/30 px-2.5 py-0.5 rounded-full font-mono font-semibold flex items-center gap-1">
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span> Synchronized Zones
+            </span>
           </div>
-          <span id="activePowerBadge" class="text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-2 py-0.5 rounded-full font-mono font-bold">
-            ONLINE
-          </span>
+          <p class="text-xs text-slate-400 mt-0.5">Isolated target zones across all cameras in a single frame &bull; Zoomable &amp; Click-to-Focus</p>
         </div>
-        <div class="my-2">
-          <div class="flex items-end justify-between text-xs mb-1">
-            <span class="text-slate-400">Battery Level</span>
-            <span id="activeDeviceBatteryPct" class="text-2xl font-bold font-mono text-emerald-400">95%</span>
+
+        <!-- Master Zoom Toolbar for Console -->
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-[11px] font-mono text-slate-400 font-semibold uppercase tracking-wider">Zone Zoom:</span>
+          <div class="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 shadow-inner">
+            <button type="button" class="btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-bold transition bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow" data-scale="1.0" onclick="setConsoleZoneZoom(1.0)">1.0x</button>
+            <button type="button" class="btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition" data-scale="1.8" onclick="setConsoleZoneZoom(1.8)">1.8x</button>
+            <button type="button" class="btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition" data-scale="2.5" onclick="setConsoleZoneZoom(2.5)">2.5x</button>
+            <button type="button" class="btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition" data-scale="4.0" onclick="setConsoleZoneZoom(4.0)">4.0x</button>
+            <button type="button" class="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg text-xs font-mono transition" title="Reset all zones to fit" onclick="resetConsoleZoneZoom()">Reset</button>
           </div>
-          <div class="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden border border-slate-700">
-            <div id="activeDeviceBatteryBar" class="h-full bg-emerald-500 rounded-full transition-all duration-500" style="width: 95%"></div>
-          </div>
-        </div>
-        <div class="pt-2 border-t border-slate-800 flex items-center justify-between text-[11px] text-slate-400">
-          <span id="activeDeviceCameraType">Samsung Galaxy S21 Ultra</span>
-          <span id="statTotalCount" class="text-amber-400 font-mono font-semibold">0 Detections</span>
+          <button type="button" onclick="refreshZoneConsole()" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow active:scale-95" title="Refresh all camera zone crops">
+            <span>🔄</span> Refresh
+          </button>
         </div>
       </div>
-    </div>
 
-        <!-- MAIN DISPLAY AREA: DUAL SIDE-BY-SIDE CAMERA SURVEILLANCE GRID -->
+      <!-- Single-Frame Multi-Zone Deck: High-Density Synchronized Grid -->
+      <div class="relative bg-slate-950/80 rounded-2xl border border-slate-800/80 p-3.5 shadow-inner overflow-hidden">
+        <div id="zoneConsoleDeck" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3.5 min-w-0">
+          <!-- Dynamic camera zone tiles injected here via app.js -->
+        </div>
+      </div>
+    </section>
+
+    <!-- MAIN DISPLAY AREA: DUAL SIDE-BY-SIDE CAMERA SURVEILLANCE GRID -->
     <section class="bg-slate-900 border border-slate-800 rounded-3xl p-5 shadow-2xl space-y-4">
       
       <!-- Section Header -->
@@ -124,8 +135,9 @@
             <span>📹</span> Device:
           </label>
           <div class="relative">
-            <select id="selectActiveDevice" onchange="selectActiveCamera(this.value)" class="appearance-none bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs py-2 pl-3 pr-8 rounded-xl border border-slate-700 hover:border-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition cursor-pointer shadow-lg">
-              <option value="S21" selected>📱 Samsung S21 Ultra (Live Stream)</option>
+            <select id="selectActiveDevice" class="appearance-none bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs py-2 pl-3 pr-8 rounded-xl border border-slate-700 hover:border-slate-600 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-amber-500 transition cursor-pointer shadow-lg">
+              <option value="S21" selected>📱 Samsung S21 Ultra</option>
+              <option value="Galaxy Tab A11+">📟 Galaxy Tab A11+</option>
               <option value="Garden">🌿 Garden Camera</option>
               <option value="cam1">📹 Cam1 Camera</option>
             </select>
@@ -666,6 +678,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=no_flicker_v19"></script>
+  <script src="/static/app.js?v=restore_live_windows_v38"></script>
 </body>
 </html>
