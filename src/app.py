@@ -1,4 +1,21 @@
 import asyncio
+import sys
+
+if sys.platform == "win32":
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+        _orig_call_connection_lost = _ProactorBasePipeTransport._call_connection_lost
+
+        def _safe_call_connection_lost(self, exc=None):
+            try:
+                _orig_call_connection_lost(self, exc)
+            except (ConnectionResetError, OSError):
+                pass
+
+        _ProactorBasePipeTransport._call_connection_lost = _safe_call_connection_lost
+    except Exception:
+        pass
+
 import base64
 import json
 import logging
@@ -20,7 +37,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.config import config
-from src.ring_client import RingManager
+from src.ring_client import RingManager, is_blank_or_disabled_frame
 from src.inference_client import RolandInferenceClient
 from src.storage import StorageManager
 from src.sampler import SamplerEngine
@@ -51,7 +68,13 @@ inference_client = RolandInferenceClient(
 
 storage_manager = StorageManager(
     detections_dir=config.storage.detections_dir,
-    db_path=config.storage.db_path
+    db_path=config.storage.db_path,
+    backend=config.storage.backend,
+    supabase_url=config.storage.supabase_url,
+    supabase_key=config.storage.supabase_key,
+    supabase_table=config.storage.supabase_table,
+    supabase_bucket=config.storage.supabase_bucket,
+    fallback_to_sqlite=config.storage.fallback_to_sqlite
 )
 
 sampler_engine = SamplerEngine(
@@ -85,8 +108,27 @@ async def lifespan(app: FastAPI):
         ring_manager._tab_cam.broadcaster.start()
     if hasattr(ring_manager, "_local_cam") and hasattr(ring_manager._local_cam, "broadcaster"):
         ring_manager._local_cam.broadcaster.start()
+
+    # Prewarm snapshot cache: immediate live Ring daylight snapshots and crisp mobile pictures
+    if hasattr(ring_manager, "_phone_cam") and hasattr(ring_manager._phone_cam, "get_picture"):
+        p = ring_manager._phone_cam.get_picture()
+        if p:
+            ring_manager._snapshot_cache["Samsung Galaxy S21 Ultra"] = p
+            ring_manager._snapshot_cache["S21"] = p
+    if hasattr(ring_manager, "_tab_cam") and hasattr(ring_manager._tab_cam, "get_picture"):
+        p = ring_manager._tab_cam.get_picture()
+        if p:
+            ring_manager._snapshot_cache["Galaxy Tab A11+"] = p
+            ring_manager._snapshot_cache["Tab A11+"] = p
+
+    for c in ring_manager._all_cameras:
+        c_name = getattr(c, "name", "")
+        is_ring = hasattr(c, "family") and c.family in ["stickup_cams", "doorbots", "doorbells"]
+        if is_ring:
+            asyncio.create_task(ring_manager.async_fetch_snapshot(camera_name=c_name))
+
     sampler_engine.start()
-    logger.info(f"Application started. Ring Camera: '{ring_manager.camera_name}' (Battery: {ring_manager.get_battery_level()}%). Background 20-second sampler active.")
+    logger.info(f"Application started on Roland 1. Inference target: '{config.inference.endpoint_url}' (Roland 3). Supabase: '{config.storage.supabase_url}'. Camera: '{ring_manager.camera_name}'.")
     yield
     # Shutdown
     if hasattr(ring_manager, "_phone_cam") and hasattr(ring_manager._phone_cam, "broadcaster"):
@@ -99,9 +141,9 @@ async def lifespan(app: FastAPI):
     logger.info("Application shutdown.")
 
 app = FastAPI(
-    title="Ring Camera Rodent Identification",
-    description="Automated rat detection via Ring camera and Gemma 4 E12b on Roland 3",
-    version="1.0.0",
+    title="Roland 1 Rodent Detection Appliance",
+    description="Real-time edge detection & Supabase services on Roland 1, multimodal AI inference on Roland 3",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -137,7 +179,43 @@ async def serve_mobile_cam():
 @app.get("/api/status")
 async def get_status():
     """Returns general system status, battery, and current statistics."""
-    return sampler_engine.get_status()
+    status = sampler_engine.get_status()
+    status["storage_backend"] = storage_manager.backend_info
+    status["nodes"] = {
+        "detection_node": config.node.detection_node,
+        "supabase_node": config.node.supabase_node,
+        "inference_node": config.node.inference_node
+    }
+    return status
+
+@app.get("/api/system/nodes")
+async def get_system_nodes():
+    """Returns the distributed topology status across Roland 1 and Roland 3."""
+    return {
+        "detection_node": {
+            "node": config.node.detection_node,
+            "role": "Real-Time Rodent Detection, Motion Gate & Camera Ingestion",
+            "active_camera": ring_manager.camera_name,
+            "cadence": "realtime" if sampler_engine._is_rat_active else "idle",
+            "interval_seconds": sampler_engine.current_interval_seconds
+        },
+        "supabase_node": {
+            "node": config.node.supabase_node,
+            "role": "Supabase Database & Storage Services",
+            "url": config.storage.supabase_url,
+            "table": config.storage.supabase_table,
+            "active_backend": storage_manager.backend_info["active_backend"],
+            "supabase_active": storage_manager.is_supabase_active,
+            "fallback_to_sqlite": storage_manager.fallback_to_sqlite
+        },
+        "inference_node": {
+            "node": config.node.inference_node,
+            "role": "AI Multimodal Sighting Verification",
+            "endpoint_url": config.inference.endpoint_url,
+            "endpoint_type": config.inference.endpoint_type,
+            "model_name": config.inference.model_name
+        }
+    }
 
 @app.get("/api/cameras")
 async def get_cameras():
@@ -607,9 +685,14 @@ async def live_camera_stream(camera_name: str):
         async def fast_broadcaster_stream():
             try:
                 real_cam_name = getattr(target_cam, "name", camera_name)
+                pic_fallback = target_cam.get_picture() if hasattr(target_cam, "get_picture") else None
                 first_frame = target_cam.broadcaster.latest_frame or getattr(target_cam, "_last_frame_bytes", None)
+                if is_blank_or_disabled_frame(first_frame) and pic_fallback:
+                    first_frame = pic_fallback
                 if not first_frame and hasattr(target_cam, "async_get_snapshot"):
                     first_frame = await target_cam.async_get_snapshot()
+                if is_blank_or_disabled_frame(first_frame) and pic_fallback:
+                    first_frame = pic_fallback
                 if not first_frame:
                     first_frame = ring_manager.create_standby_frame(f"Connecting {real_cam_name}...", real_cam_name)
 
@@ -630,8 +713,10 @@ async def live_camera_stream(camera_name: str):
                         frame = await asyncio.wait_for(q.get(), timeout=1.0)
                     except asyncio.TimeoutError:
                         frame = target_cam.broadcaster.latest_frame
-                        if not frame:
-                            frame = ring_manager.create_standby_frame(f"{real_cam_name} Reconnecting (Check USB)...", real_cam_name)
+                    if is_blank_or_disabled_frame(frame) and pic_fallback:
+                        frame = pic_fallback
+                    if not frame:
+                        frame = ring_manager.create_standby_frame(f"{real_cam_name} Reconnecting (Check USB)...", real_cam_name)
 
                     now = time.time()
                     if frame and (now - last_sent >= 0.05):
@@ -683,8 +768,11 @@ async def live_camera_stream(camera_name: str):
             init_hud = apply_live_cctv_hud(init_frame, real_cam_name, bat)
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + init_hud + b"\r\n")
 
+            # Trigger immediate fresh snapshot fetch from Ring cloud
+            asyncio.create_task(safe_bg_fetch(camera_name))
+
             # 2. Continuous non-blocking real-time stream loop (10 FPS with live HUD)
-            last_bg_refresh = 0.0
+            last_bg_refresh = time.time()
             while True:
                 frame = ring_manager._snapshot_cache.get(camera_name)
                 if not frame and is_phone and hasattr(ring_manager, "_phone_cam"):
@@ -1099,35 +1187,59 @@ async def get_camera_zone_crop(camera_name: str):
     # 1. Fetch current frame for THIS specific camera
     frame = None
     if target_cam:
-        if hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
-            target_cam.broadcaster.start()
-            frame = target_cam.broadcaster.latest_frame
-        if not frame and hasattr(target_cam, "latest_frame") and target_cam.latest_frame:
-            frame = target_cam.latest_frame
-        if not frame and hasattr(target_cam, "async_get_snapshot") and not hasattr(target_cam, "_ring"):
-            try:
-                frame = await target_cam.async_get_snapshot()
-            except Exception:
-                pass
+        is_ring = hasattr(target_cam, "family") and target_cam.family in ["stickup_cams", "doorbots", "doorbells"] and not getattr(target_cam, "is_local", False) and not getattr(target_cam, "is_phone", False)
 
-    # 2. For Ring cameras or non-broadcasters, refresh if cached frame is older than 20 seconds
-    cached_age = time.time() - getattr(ring_manager, "_snapshot_timestamps", {}).get(camera_name, 0.0)
-    has_broadcaster = target_cam and hasattr(target_cam, "broadcaster") and target_cam.broadcaster is not None
-    if (not frame or cached_age > 20.0) and target_cam and not has_broadcaster:
+        # 1. Ring cameras: actively query Ring snapshot endpoint for fresh live image
+        if is_ring:
+            try:
+                snap, _, _, _ = await ring_manager.async_fetch_snapshot(camera_name=camera_name)
+                if snap and len(snap) > 2000 and not is_blank_or_disabled_frame(snap):
+                    frame = snap
+            except Exception as e:
+                logger.debug(f"Direct Ring snapshot fetch in zone_crop failed for {camera_name}: {e}")
+
+        # 2. Local / Mobile cameras: try broadcaster / live stream
+        if not frame:
+            if hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
+                target_cam.broadcaster.start()
+                f = target_cam.broadcaster.latest_frame
+                if f and not is_blank_or_disabled_frame(f):
+                    frame = f
+            if not frame and hasattr(target_cam, "latest_frame") and target_cam.latest_frame:
+                f = target_cam.latest_frame
+                if f and not is_blank_or_disabled_frame(f):
+                    frame = f
+            if not frame and hasattr(target_cam, "async_get_snapshot"):
+                try:
+                    f = await target_cam.async_get_snapshot()
+                    if f and not is_blank_or_disabled_frame(f):
+                        frame = f
+                except Exception:
+                    pass
+
+        # 3. If mobile camera is offline/blank, fall back to its assigned picture
+        if not frame and hasattr(target_cam, "get_picture"):
+            pic = target_cam.get_picture()
+            if pic and not is_blank_or_disabled_frame(pic):
+                frame = pic
+
+    if not frame:
+        f = ring_manager._snapshot_cache.get(camera_name)
+        if f and not is_blank_or_disabled_frame(f):
+            frame = f
+        if not frame:
+            for k, v in ring_manager._snapshot_cache.items():
+                if (k.lower() == camera_name.lower() or _normalize_cam_key(k) == _normalize_cam_key(camera_name)) and not is_blank_or_disabled_frame(v):
+                    frame = v
+                    break
+
+    if not frame and target_cam:
         try:
             snap, _, _, _ = await ring_manager.async_fetch_snapshot(camera_name=camera_name)
-            if snap:
+            if snap and not is_blank_or_disabled_frame(snap):
                 frame = snap
         except Exception as e:
             logger.debug(f"async_fetch_snapshot failed for {camera_name}: {e}")
-
-    if not frame:
-        frame = ring_manager._snapshot_cache.get(camera_name)
-        if not frame:
-            for k, v in ring_manager._snapshot_cache.items():
-                if k.lower() == camera_name.lower() or _normalize_cam_key(k) == _normalize_cam_key(camera_name):
-                    frame = v
-                    break
 
     no_cache_headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -1182,17 +1294,57 @@ async def get_cameras_zone_summary():
         poly = inference_client.get_camera_polygon(cam_name, fallback=False)
         has_zone = poly is not None and len(poly) >= 3
         is_sel = (cam_name.lower() == (active_cam_name or "").lower())
+        is_mobile = any(k in cam_name.lower() for k in ["s21", "tab", "galaxy", "phone", "tablet"])
         results.append({
             "name": cam_name,
             "has_zone": has_zone,
             "polygon": poly,
             "crop_url": f"/api/camera/{cam_name}/zone_crop",
+            "picture_url": f"/api/camera/{cam_name}/picture",
             "is_active": is_sel,
             "is_online": True,
+            "uses_pictures": is_mobile or c.get("uses_pictures", False),
             "battery_percentage": c.get("battery_percentage"),
             "delta_percent": 0.0
         })
     return {"cameras": results, "active_camera": active_cam_name}
+
+
+@app.get("/api/camera/{camera_name}/picture")
+async def get_camera_picture(camera_name: str):
+    """Returns the static picture snapshot assigned to this camera."""
+    target_cam = ring_manager.find_camera(camera_name)
+    pic = None
+    if target_cam and hasattr(target_cam, "get_picture"):
+        pic = target_cam.get_picture()
+    if not pic:
+        pic = ring_manager._snapshot_cache.get(camera_name)
+    if not pic:
+        for p in [Path("data/s21_picture.jpg"), Path("data/tab_a11_picture.jpg"), Path("data/video_frames/frame_00s.jpg")]:
+            if p.exists():
+                pic = p.read_bytes()
+                break
+    if not pic:
+        raise HTTPException(status_code=404, detail="No picture found for this camera")
+    return Response(content=pic, media_type="image/jpeg", headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate"
+    })
+
+
+@app.post("/api/camera/{camera_name}/upload_picture")
+async def upload_camera_picture(camera_name: str, file: UploadFile = File(...)):
+    """Uploads a fresh picture for a camera (especially mobile devices)."""
+    content = await file.read()
+    if not content or len(content) < 500:
+        raise HTTPException(status_code=400, detail="Invalid picture file")
+    target_cam = ring_manager.find_camera(camera_name)
+    if target_cam and hasattr(target_cam, "set_picture"):
+        target_cam.set_picture(content)
+    ring_manager._snapshot_cache[camera_name] = content
+    if target_cam and hasattr(target_cam, "name"):
+        ring_manager._snapshot_cache[target_cam.name] = content
+    logger.info(f"📸 Fresh picture uploaded for {camera_name} ({len(content)} bytes)")
+    return {"success": True, "camera": camera_name, "bytes": len(content)}
 
 
 class BacklogFolderPayload(BaseModel):
