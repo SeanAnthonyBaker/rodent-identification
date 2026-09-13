@@ -83,7 +83,9 @@
 
         <!-- Master Zoom Toolbar for Console -->
         <div class="flex items-center gap-2 flex-wrap">
-          <span class="text-[11px] font-mono text-slate-400 font-semibold uppercase tracking-wider">Zone Zoom:</span>
+          <span class="text-[11px] font-mono text-slate-400 font-semibold uppercase tracking-wider">
+            <span id="consoleZoomTargetLabel" class="text-amber-400 font-bold">Active Camera</span> Zoom:
+          </span>
           <div class="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 shadow-inner">
             <button type="button" class="btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-bold transition bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow" data-scale="1.0" onclick="setConsoleZoneZoom(1.0)">1.0x</button>
             <button type="button" class="btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition" data-scale="1.8" onclick="setConsoleZoneZoom(1.8)">1.8x</button>
@@ -186,6 +188,11 @@
           <!-- 90 Degree Rotation -->
           <button id="btnRotateActiveCamera" type="button" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-cyan-300 font-semibold rounded-xl text-xs transition flex items-center gap-1 active:scale-95" title="Rotate camera picture 90 degrees">
             <span>🔄</span> 90°
+          </button>
+
+          <!-- 180 Degree Reverse View -->
+          <button id="btnReverseActiveCamera" type="button" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-amber-300 font-semibold rounded-xl text-xs transition flex items-center gap-1 active:scale-95" title="Reverse / Flip camera view 180 degrees">
+            <span>🔃</span> Reverse 180°
           </button>
 
           <!-- Zoom Controls with Yellow Circle on Selected Scale -->
@@ -678,6 +685,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=restore_live_windows_v38"></script>
+  <script src="/static/app.js?v=selective_zoom_reverse_view_v39"></script>
 </body>
 </html>

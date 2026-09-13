@@ -343,6 +343,12 @@ async function selectActiveCamera(camName) {
     });
   } catch (e) {}
 
+  // Synchronize Zone Zoom toolbar to selected camera's current scale and label
+  const activeDeckScale = (typeof tileZoomState !== "undefined" && tileZoomState[normalizedCam]?.scale) || 1.0;
+  if (typeof updateConsoleZoomToolbar === "function") {
+    updateConsoleZoomToolbar(activeDeckScale, normalizedCam);
+  }
+
   // Also refresh console deck to reflect selection
   if (typeof refreshZoneConsole === "function") {
     refreshZoneConsole();
@@ -656,6 +662,7 @@ function initEventListeners() {
         localStorage.setItem("camera_rotations", JSON.stringify(cameraRotationState));
       } catch (e) {}
       applySurveillanceTransform();
+      updateDeckTileTransform(currentSelectedCamera);
 
       if (currentSelectedCamera === "S21") {
         const orientMap = { 0: "landscape", 90: "upsidedown", 180: "upsidedown_landscape", 270: "portrait" };
@@ -666,6 +673,13 @@ function initEventListeners() {
           });
         } catch (err) {}
       }
+    });
+  }
+
+  // 180° Reverse view for active camera
+  if (btnReverseActiveCamera) {
+    btnReverseActiveCamera.addEventListener("click", () => {
+      toggleCameraReverseView(currentSelectedCamera);
     });
   }
 
@@ -3680,13 +3694,32 @@ function renderZoneConsole(cameras, activeCam) {
       if (batEl && cam.battery_percentage !== undefined && cam.battery_percentage !== null) {
         batEl.textContent = `${cam.battery_percentage}%`;
       }
+
+      const pillWrap = tile.querySelector(".zone-status-pill-wrap");
+      if (pillWrap) {
+        pillWrap.innerHTML = cam.has_zone
+          ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
+              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
+            </span>`
+          : cam.uses_pictures
+          ? `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-sky-950/80 text-sky-300 border border-sky-700/60 flex items-center gap-1 whitespace-nowrap">
+              <span>📸</span> Picture
+            </span>`
+          : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-slate-800/90 text-slate-200 border border-slate-700/60 flex items-center gap-1 whitespace-nowrap">
+              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
+            </span>`;
+      }
       return;
     }
 
     // First time render: Build full card structure
     tile = document.createElement("div");
     tile.dataset.cam = cam.name;
-    tile.className = `zone-console-card relative flex flex-col bg-slate-900 border ${isSelected ? "border-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.25)]" : "border-slate-800 hover:border-slate-700"} rounded-xl overflow-hidden transition group min-w-0`;
+    tile.className = `zone-console-card relative flex flex-col bg-slate-900 border ${isSelected ? "border-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.25)]" : "border-slate-800 hover:border-slate-700"} rounded-xl overflow-hidden transition group min-w-0 cursor-pointer`;
+    tile.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      selectActiveCamera(cam.name);
+    });
 
     let displayName = cam.name;
     if (displayName.toLowerCase().includes("s21")) displayName = "S21 Ultra";
@@ -3696,10 +3729,16 @@ function renderZoneConsole(cameras, activeCam) {
     else if (displayName.toLowerCase().includes("local")) displayName = "Local USB";
 
     if (!tileZoomState[cam.name]) {
-      tileZoomState[cam.name] = { scale: consoleZoneScale, originX: 50, originY: 50 };
+      tileZoomState[cam.name] = { scale: 1.0, originX: 50, originY: 50 };
     }
     const state = tileZoomState[cam.name];
     const cropUrl = `${cam.crop_url}?t=${Date.now()}`;
+
+    const rot = cameraRotationState[cam.name] ?? (isTab ? cameraRotationState["Galaxy Tab A11+"] : 0) ?? 0;
+    const initialTransforms = [];
+    if (state.scale > 1.0) initialTransforms.push(`scale(${state.scale})`);
+    if (rot !== 0) initialTransforms.push(`rotate(${rot}deg)`);
+    const initialTransformStr = initialTransforms.length > 0 ? initialTransforms.join(" ") : "none";
 
     tile.innerHTML = `
       <!-- Card Header: Razor-aligned, fixed height, bright online LED, battery indicator -->
@@ -3709,15 +3748,24 @@ function renderZoneConsole(cameras, activeCam) {
           <span class="text-xs font-semibold text-slate-100 truncate tracking-wide" title="${cam.name}">${displayName}</span>
           ${(cam.battery_percentage !== undefined && cam.battery_percentage !== null) ? `<span class="zone-battery-badge text-[9px] text-emerald-400/80 font-mono font-bold bg-emerald-950/60 px-1 py-0.2 rounded border border-emerald-800/40">${cam.battery_percentage}%</span>` : ""}
         </div>
-        <div class="flex-shrink-0">
-          ${cam.has_zone
-            ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
-                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
-              </span>`
-            : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-slate-800/90 text-slate-200 border border-slate-700/60 flex items-center gap-1 whitespace-nowrap">
-                <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
-              </span>`
-          }
+        <div class="flex items-center gap-1.5 flex-shrink-0">
+          <button type="button" class="px-1.5 py-0.5 rounded bg-slate-800/90 hover:bg-slate-700 text-slate-300 hover:text-amber-300 border border-slate-700/60 text-[10px] font-mono flex items-center gap-0.5 transition shadow-sm" title="Reverse / Flip 180° for ${displayName}" onclick="event.stopPropagation(); toggleCameraReverseView('${cam.name}')">
+            <span>🔃</span> 180°
+          </button>
+          <div class="zone-status-pill-wrap">
+            ${cam.has_zone
+              ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
+                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
+                </span>`
+              : cam.uses_pictures
+              ? `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-sky-950/80 text-sky-300 border border-sky-700/60 flex items-center gap-1 whitespace-nowrap">
+                  <span>📸</span> Picture
+                </span>`
+              : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-slate-800/90 text-slate-200 border border-slate-700/60 flex items-center gap-1 whitespace-nowrap">
+                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
+                </span>`
+            }
+          </div>
         </div>
       </div>
 
@@ -3727,15 +3775,20 @@ function renderZoneConsole(cameras, activeCam) {
           src="${cropUrl}" 
           alt="${cam.name} Zone" 
           class="zone-crop-img max-w-full max-h-full object-contain select-none transition-transform duration-100"
-          style="transform-origin: ${state.originX}% ${state.originY}%; transform: scale(${state.scale});"
+          style="transform-origin: ${state.originX}% ${state.originY}%; transform: ${initialTransformStr};"
           loading="lazy"
         />
 
-        <!-- Hover Overlay with Select Button -->
-        <div class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center pointer-events-none">
-          <button type="button" class="pointer-events-auto px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-xl flex items-center gap-1.5 active:scale-95 transition" onclick="selectActiveCamera('${cam.name}')">
-            <span>📺</span> Select Camera
+        <!-- Hover Overlay with Select & Upload Buttons -->
+        <div class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-2 pointer-events-none p-2">
+          <button type="button" class="pointer-events-auto px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-xl flex items-center gap-1 active:scale-95 transition" onclick="selectActiveCamera('${cam.name}')">
+            <span>📺</span> Select
           </button>
+          ${cam.uses_pictures ? `
+          <button type="button" class="pointer-events-auto px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl shadow-xl flex items-center gap-1 active:scale-95 transition" onclick="uploadCameraPicture('${cam.name}')" title="Upload new picture for ${displayName}">
+            <span>📸</span> Set Pic
+          </button>
+          ` : ""}
         </div>
 
         <!-- Magnification Watermark Badge -->
@@ -3755,7 +3808,7 @@ function renderZoneConsole(cameras, activeCam) {
         const originX = Math.max(0, Math.min(100, (mouseX / rect.width) * 100));
         const originY = Math.max(0, Math.min(100, (mouseY / rect.height) * 100));
 
-        const curState = tileZoomState[cam.name] || { scale: consoleZoneScale, originX: 50, originY: 50 };
+        const curState = tileZoomState[cam.name] || { scale: 1.0, originX: 50, originY: 50 };
         const step = e.deltaY < 0 ? 0.35 : -0.35;
         const newScale = Math.min(5.0, Math.max(1.0, Math.round((curState.scale + step) * 10) / 10));
 
@@ -3770,14 +3823,22 @@ function renderZoneConsole(cameras, activeCam) {
         tileZoomState[cam.name] = curState;
 
         const img = vp.querySelector("img");
+        const cRot = cameraRotationState[cam.name] ?? (isTab ? cameraRotationState["Galaxy Tab A11+"] : 0) ?? 0;
         if (img) {
           img.style.transformOrigin = `${curState.originX}% ${curState.originY}%`;
-          img.style.transform = `scale(${curState.scale})`;
+          const transforms = [];
+          if (curState.scale > 1.0) transforms.push(`scale(${curState.scale})`);
+          if (cRot !== 0) transforms.push(`rotate(${cRot}deg)`);
+          img.style.transform = transforms.length > 0 ? transforms.join(" ") : "none";
         }
 
         const badge = vp.querySelector(".zoom-indicator-badge");
         if (badge) {
           badge.textContent = `${curState.scale.toFixed(1)}x`;
+        }
+
+        if (isCameraMatch(cam.name, currentSelectedCamera)) {
+          updateConsoleZoomToolbar(curState.scale, cam.name);
         }
       }, { passive: false });
 
@@ -3796,55 +3857,118 @@ function renderZoneConsole(cameras, activeCam) {
         tileZoomState[cam.name] = curState;
 
         const img = vp.querySelector("img");
+        const cRot = cameraRotationState[cam.name] ?? (isTab ? cameraRotationState["Galaxy Tab A11+"] : 0) ?? 0;
         if (img) {
           img.style.transformOrigin = `${curState.originX}% ${curState.originY}%`;
-          img.style.transform = `scale(${curState.scale})`;
+          const transforms = [];
+          if (curState.scale > 1.0) transforms.push(`scale(${curState.scale})`);
+          if (cRot !== 0) transforms.push(`rotate(${cRot}deg)`);
+          img.style.transform = transforms.length > 0 ? transforms.join(" ") : "none";
         }
 
         const badge = vp.querySelector(".zoom-indicator-badge");
         if (badge) {
           badge.textContent = `${curState.scale.toFixed(1)}x`;
         }
+
+        if (isCameraMatch(cam.name, currentSelectedCamera)) {
+          updateConsoleZoomToolbar(curState.scale, cam.name);
+        }
       });
     }
 
     deck.appendChild(tile);
   });
+
+  // Synchronize console zoom toolbar to currently selected window
+  updateConsoleZoomToolbar(tileZoomState[currentSelectedCamera]?.scale || 1.0, currentSelectedCamera);
 }
 
 function setConsoleZoneZoom(scale) {
-  consoleZoneScale = scale;
-  document.querySelectorAll(".btn-console-zoom").forEach(btn => {
-    const s = parseFloat(btn.dataset.scale);
-    if (Math.abs(s - scale) < 0.05) {
-      btn.className = "btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-bold transition bg-amber-500/20 text-amber-300 border border-amber-500/40 shadow";
-    } else {
-      btn.className = "btn-console-zoom px-2.5 py-1 rounded-lg text-xs font-medium text-slate-400 hover:text-white transition";
-    }
-  });
+  const targetCam = currentSelectedCamera || "Garden";
+  if (!tileZoomState[targetCam]) {
+    tileZoomState[targetCam] = { scale: 1.0, originX: 50, originY: 50 };
+  }
+  const curState = tileZoomState[targetCam];
+  curState.scale = scale;
+  curState.originX = 50;
+  curState.originY = 50;
 
-  // Apply consistently across all camera tiles in deck
-  document.querySelectorAll(".zone-tile-viewport").forEach(vp => {
-    const camName = vp.dataset.cam;
-    const curState = { scale: scale, originX: 50, originY: 50 };
-    if (camName) tileZoomState[camName] = curState;
+  // Apply ONLY to the currently selected camera's card
+  const deck = document.getElementById("zoneConsoleDeck");
+  if (deck) {
+    const cards = deck.querySelectorAll(".zone-console-card");
+    cards.forEach(card => {
+      if (isCameraMatch(card.dataset.cam, targetCam)) {
+        tileZoomState[card.dataset.cam] = curState;
+        const vp = card.querySelector(".zone-tile-viewport");
+        const img = card.querySelector(".zone-crop-img");
+        const isTab = (card.dataset.cam || "").toLowerCase().includes("tab") || (card.dataset.cam || "").toLowerCase().includes("a11");
+        const rot = cameraRotationState[card.dataset.cam] ?? (isTab ? cameraRotationState["Galaxy Tab A11+"] : 0) ?? cameraRotationState[targetCam] ?? 0;
+        if (img) {
+          img.style.transformOrigin = "50% 50%";
+          const transforms = [];
+          if (scale > 1.0) transforms.push(`scale(${scale})`);
+          if (rot !== 0) transforms.push(`rotate(${rot}deg)`);
+          img.style.transform = transforms.length > 0 ? transforms.join(" ") : "none";
+        }
 
-    const img = vp.querySelector("img");
-    if (img) {
-      img.style.transformOrigin = "50% 50%";
-      img.style.transform = `scale(${scale})`;
-    }
+        const badge = card.querySelector(".zoom-indicator-badge");
+        if (badge) {
+          badge.textContent = `${scale.toFixed(1)}x`;
+        }
+      }
+    });
+  }
 
-    const badge = vp.querySelector(".zoom-indicator-badge");
-    if (badge) {
-      badge.textContent = `${scale.toFixed(1)}x`;
-    }
-  });
+  updateConsoleZoomToolbar(scale, targetCam);
 }
 
 function resetConsoleZoneZoom() {
   setConsoleZoneZoom(1.0);
 }
+
+window.uploadCameraPicture = async function(cameraName) {
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = "image/jpeg,image/png,image/webp,image/*";
+  fileInput.style.display = "none";
+  document.body.appendChild(fileInput);
+
+  fileInput.onchange = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) {
+      fileInput.remove();
+      return;
+    }
+    const fd = new FormData();
+    fd.append("file", file);
+
+    try {
+      const resp = await fetch(`/api/camera/${encodeURIComponent(cameraName)}/upload_picture`, {
+        method: "POST",
+        body: fd
+      });
+      if (resp.ok) {
+        console.info(`📸 Picture updated for ${cameraName}`);
+        await refreshZoneConsole();
+        const mainImg = document.getElementById("mainCameraFeedImg");
+        if (mainImg && (currentSelectedCamera === cameraName || (cameraName.toLowerCase().includes("s21") && currentSelectedCamera === "S21"))) {
+          mainImg.src = `/api/camera/${encodeURIComponent(cameraName)}/picture?t=${Date.now()}`;
+        }
+      } else {
+        alert("Failed to upload camera picture: " + resp.statusText);
+      }
+    } catch (err) {
+      console.error("Picture upload failed:", err);
+      alert("Error uploading picture: " + err.message);
+    } finally {
+      fileInput.remove();
+    }
+  };
+
+  fileInput.click();
+};
 
 window.setConsoleZoneZoom = setConsoleZoneZoom;
 window.resetConsoleZoneZoom = resetConsoleZoneZoom;
@@ -3856,5 +3980,6 @@ if (document.readyState === "loading") {
 } else {
   initZoneConsole();
 }
+
 
 
