@@ -32,3 +32,8 @@ async def test_fallback_simulation():
     assert res is not None
     assert isinstance(res.is_rat_detected, bool)
     assert res.confidence >= 0.0
+
+def test_roland3_inference_endpoint_default():
+    client = RolandInferenceClient()
+    assert client.endpoint_url == "http://roland3:11434"
+    assert "roland3" in client.endpoint_url

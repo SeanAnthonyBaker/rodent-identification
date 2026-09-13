@@ -1,0 +1,107 @@
+version: "3.8"
+
+# ==============================================================================
+# ROLAND 1 DEPLOYMENT STACK
+# Edge Rodent Detection & Supabase Database Services Node
+# ==============================================================================
+
+services:
+  # 1. Edge Rodent Detection Appliance
+  ratwatch-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ratwatch-detector-roland1
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - RODENT_NODE_ROLE=detection
+      - RODENT_DETECTION_NODE=roland1
+      - RODENT_INFERENCE_NODE=roland3
+      - RODENT_SUPABASE_NODE=roland1
+      - RODENT_INFERENCE_ENDPOINT_URL=http://roland3:11434
+      - RODENT_INFERENCE_ENDPOINT_TYPE=ollama
+      - RODENT_INFERENCE_MODEL_NAME=gemma-4-e12b
+      - RODENT_STORAGE_BACKEND=supabase
+      - RODENT_SUPABASE_URL=http://localhost:54321
+      - RODENT_SUPABASE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-anon_key_for_roland1}
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    devices:
+      - /dev/video0:/dev/video0  # Direct USB/Webcam on Roland 1
+    depends_on:
+      - supabase-kong
+
+  # 2. Supabase PostgreSQL Database (roland1)
+  supabase-db:
+    image: supabase/postgres:15.1.1.78
+    container_name: supabase-db-roland1
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_password_roland1}
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      - ./supabase/migrations:/docker-entrypoint-initdb.d:ro
+
+  # 3. Supabase PostgREST (roland1)
+  supabase-rest:
+    image: postgrest/postgrest:v12.0.2
+    container_name: supabase-rest-roland1
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PGRST_DB_URI: postgres://postgres:${POSTGRES_PASSWORD:-postgres_password_roland1}@supabase-db:5432/postgres
+      PGRST_DB_SCHEMAS: public,storage
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super_secret_jwt_key_for_roland1_supabase_32chars_long}
+    depends_on:
+      - supabase-db
+
+  # 4. Supabase Storage API (roland1)
+  supabase-storage:
+    image: supabase/storage-api:v1.0.6
+    container_name: supabase-storage-roland1
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      ANON_KEY: ${SUPABASE_ANON_KEY:-anon_key_for_roland1}
+      SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-anon_key_for_roland1}
+      POSTGREST_URL: http://supabase-rest:3000
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super_secret_jwt_key_for_roland1_supabase_32chars_long}
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres_password_roland1}@supabase-db:5432/postgres
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      TENANT_ID: stub
+    volumes:
+      - supabase-storage-data:/var/lib/storage
+    depends_on:
+      - supabase-db
+      - supabase-rest
+
+  # 5. Supabase Kong API Gateway (roland1)
+  supabase-kong:
+    image: kong:2.8.1
+    container_name: supabase-kong-roland1
+    restart: unless-stopped
+    ports:
+      - "54321:8000"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /var/lib/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth
+    volumes:
+      - ./supabase/kong.yml:/var/lib/kong/kong.yml:ro
+    depends_on:
+      - supabase-rest
+      - supabase-storage
+
+volumes:
+  supabase-db-data:
+  supabase-storage-data:

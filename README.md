@@ -1,27 +1,60 @@
-# Sovereign Rat Watch: S21 + DGX Spark Gemma 4 26B + Wear OS
+# Sovereign Rat Watch: Distributed Edge Appliance (roland1 + roland3 + Wear OS)
 
-A 100% on-premises, zero-cloud rat detection and validation appliance that achieves an end-to-end detection lead time of **under 2 seconds**:
+A 100% on-premises, zero-cloud distributed rat detection and validation appliance partitioned across dedicated compute nodes:
 
-1. **Samsung Galaxy S21 (`uk.local.ratwatch.phone`)**: 
-   - Camera2 1280x720 @ 15fps with hardware stabilization bypassed.
-   - 160x90 grayscale motion gate ($\le 15\text{ ms}$).
-   - On-device single-class `rat` YOLO11n INT8 ($416\times 416$) executing in $\le 60\text{ ms}$ on Exynos 2100 / $\le 35\text{ ms}$ on Snapdragon 888.
-   - 40% expanded context crop ($\le 640\text{px}$, JPEG q72, $\le 80\text{ KB}$).
-   - Non-blocking HTTP multipart POST to DGX Spark in $\le 150\text{ ms}$ from trigger frame.
-2. **NVIDIA DGX Spark 128 GB (`ratwatch-spark` + vLLM Port 8000 & 8088)**:
-   - vLLM serving `Gemma-4-26B-A4B-IT-NVFP4` with `--moe-backend marlin`, `--kv-cache-dtype fp8`, vision token budget $= 280$, and thinking mode **OFF**.
-   - Validates sighting in $1.2 - 1.65\text{ s}$ with room/garden-relative spatial location text.
-   - Pushes direct LAN alerts to Wear OS watch in $\le 45\text{ ms}$.
+1. **`roland1` — Edge Rodent Detection & Supabase Database Services Node**:
+   - **Rodent Detection Pipeline**: Ingests direct local camera (`LocalRolandCamera`), Samsung S21 Ultra stream / USB ADB forward, or Ring doorbell cameras.
+   - **Low-Latency Filter**: Runs 160x90 grayscale motion gate ($\le 15\text{ ms}$) and on-device YOLO11n object candidate detector ($\le 35\text{ ms}$).
+   - **Continuous Sampling Engine**: Accelerates from idle monitoring cadence to real-time (1s) immediately upon activity.
+   - **Supabase Database Services**: Self-hosted Supabase stack on `roland1` (Port 54321 / 8000 via Kong, PostgREST on Port 3000, PostgreSQL on Port 5432) storing sightings, continuous event sessions, and high-res JPEG crops with local SQLite resilience fallback.
+   - **Web Dashboard**: Real-time CCTV HUD, center target reticle, target selector dropdown, and WebSocket stream.
+
+2. **`roland3` — Dedicated AI Inference Compute Node**:
+   - **Multimodal AI Verification**: High-throughput Ollama / vLLM serving Gemma 4 models (`http://roland3:11434` or Port 8000/8088).
+   - Validates candidate sightings in under 1.5 seconds with room/garden spatial descriptions and closed JSON output schema.
+   - Eliminates inference load from the edge detection node `roland1`.
+
 3. **Wear OS Watch (`uk.local.ratwatch.watch`)**:
    - Listens on `http://0.0.0.0:8099/alert` over local Wi-Fi.
    - Triggers 400ms haptic vibration with a 240px thumbnail and 1-line location banner (`"Rat along shed plinth"`).
-4. **Existing Web Front End Dashboard**:
-   - Reuses current interactive UI with live feed, large scrollable target dropdown, chronological carousel, and **small center target reticle**.
-   - Receives instant `possible` ($\le 130\text{ ms}$) and confirmed `verdict` / `rejected` WebSocket events.
 
 ---
 
 ## 1. System Topology & Latency Budget
+
+```
+ ┌────────────────────────────────────────────────────────┐
+ │                      ROLAND 1                          │
+ │  ┌──────────────────────────────────────────────────┐  │
+ │  │  Rodent Detection Engine                         │  │
+ │  │  - Camera Ingestion (USB/Webcam, S21, Ring)      │  │
+ │  │  - MotionGate (160x90 AbsDiff ≤15ms)             │  │
+ │  │  - FastObjectDetector (YOLO11n candidate filter) │  │
+ │  │  - SamplerEngine (Real-time cadence boost)       │  │
+ │  │  - FastAPI Web Application & WebSocket           │  │
+ │  └────────────────────────┬─────────────────────────┘  │
+ │                           │                            │
+ │  ┌────────────────────────▼─────────────────────────┐  │
+ │  │  Supabase Database Services (roland1)            │  │
+ │  │  - Kong Gateway (port 54321)                     │  │
+ │  │  - PostgREST REST API (/rest/v1)                 │  │
+ │  │  - PostgreSQL Database (detections, events)      │  │
+ │  │  - Supabase Storage (detections bucket)          │  │
+ │  └──────────────────────────────────────────────────┘  │
+ └───────────────────────────┬────────────────────────────┘
+                             │ Async AI Sighting Verification
+                             │ (Crop + Reference Image POST)
+                             ▼
+ ┌────────────────────────────────────────────────────────┐
+ │                      ROLAND 3                          │
+ │  ┌──────────────────────────────────────────────────┐  │
+ │  │  AI Inference Engine                             │  │
+ │  │  - Ollama / vLLM (Gemma 4 12B / 26B)             │  │
+ │  │  - Port 11434 (Ollama) or Port 8000/8088 (vLLM)  │  │
+ │  │  - Structured JSON Output & Verification         │  │
+ │  └──────────────────────────────────────────────────┘  │
+ └────────────────────────────────────────────────────────┘
+```
 
 ```
 [Rat Enters Scene]
@@ -95,19 +128,29 @@ A 100% on-premises, zero-cloud rat detection and validation appliance that achie
 
 ## 3. Installation & Deployment Order
 
-### Step 1: Deploy DGX Spark 128 GB
-On your NVIDIA DGX Spark machine:
+### Step 1: Deploy AI Inference Node (roland3)
+On your GPU / Ollama server **roland3**:
 ```bash
-cd spark
-docker compose up -d --build
+docker compose -f docker-compose.roland3.yml up -d
 ```
-Verify health:
+Verify Ollama / vLLM health:
 ```bash
-curl http://localhost:8088/health
-# {"ok": true, "model": "gemma4-26b", "warm": true, "infer_p50_ms": 1380}
+curl http://roland3:11434/api/tags
+# or vLLM: curl http://roland3:8000/v1/models
 ```
 
-### Step 2: Build & Install S21 Phone App
+### Step 2: Deploy Detection & Supabase Database Services (roland1)
+On your Edge appliance **roland1**:
+```bash
+docker compose -f docker-compose.roland1.yml up -d
+```
+Verify Supabase and Detection status:
+```bash
+curl http://roland1:8000/api/system/nodes
+# Returns detection_node, supabase_node, and inference_node topology
+```
+
+### Step 3: Build & Install S21 Phone App (Optional Mobile Edge)
 ```bash
 cd android
 ./gradlew assembleDebug
@@ -115,7 +158,7 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 Open **Rat Watch S21** and tap **ARM DETECTOR**.
 
-### Step 3: Build & Install Wear OS Watch App
+### Step 4: Build & Install Wear OS Watch App
 ```bash
 cd wear
 ./gradlew assembleDebug
@@ -138,4 +181,4 @@ adb -s <watch-ip>:5555 install app/build/outputs/apk/debug/app-debug.apk
 ```bash
 uv run pytest
 ```
-All 17 automated tests pass (API, Vision Engine, DGX Spark Validator, Storage, Multi-Object Filter).
+All 23 automated tests pass (API, Vision Engine, DGX Spark Validator, Storage, Supabase on roland1, Fallback SQLite, Multi-Object Filter).

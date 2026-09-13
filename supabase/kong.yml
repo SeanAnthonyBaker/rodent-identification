@@ -1,0 +1,19 @@
+_format_version: "2.1"
+_transform: true
+
+services:
+  - name: rest-v1
+    url: http://supabase-rest:3000/
+    routes:
+      - name: rest-v1-all
+        paths:
+          - /rest/v1/
+        strip_path: true
+
+  - name: storage-v1
+    url: http://supabase-storage:5000/
+    routes:
+      - name: storage-v1-all
+        paths:
+          - /storage/v1/
+        strip_path: true

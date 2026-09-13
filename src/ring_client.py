@@ -40,6 +40,58 @@ def is_blank_or_disabled_frame(frame_bytes: Optional[bytes]) -> bool:
         return True
 
 
+def capture_desktop_window_frame(keyword: str) -> Optional[bytes]:
+    """Captures the visible window frame matching keyword from the Default interactive desktop.
+    Excludes small dialogs/prompts (< 380x350) and minimized windows.
+    """
+    try:
+        import win32service, win32gui, win32ui, win32con, ctypes
+        from PIL import Image
+        from io import BytesIO
+
+        hdesk = win32service.OpenDesktop('Default', 0, False, 0x01FF)
+        ctypes.windll.user32.SetThreadDesktop(int(hdesk))
+        target_hwnd = None
+        for h in hdesk.EnumDesktopWindows():
+            if win32gui.IsWindowVisible(h) and not win32gui.IsIconic(h):
+                t = win32gui.GetWindowText(h)
+                if t and keyword.lower() in t.lower():
+                    rect = win32gui.GetWindowRect(h)
+                    w = rect[2] - rect[0]
+                    h_len = rect[3] - rect[1]
+                    if w > 380 and h_len > 350:
+                        target_hwnd = int(h)
+                        break
+        if not target_hwnd:
+            return None
+
+        rect = win32gui.GetWindowRect(target_hwnd)
+        w = rect[2] - rect[0]
+        h_len = rect[3] - rect[1]
+        hwndDC = win32gui.GetWindowDC(target_hwnd)
+        mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+        saveDC = mfcDC.CreateCompatibleDC()
+        saveBitMap = win32ui.CreateBitmap()
+        saveBitMap.CreateCompatibleBitmap(mfcDC, w, h_len)
+        saveDC.SelectObject(saveBitMap)
+        ctypes.windll.user32.PrintWindow(target_hwnd, saveDC.GetSafeHdc(), 2)
+        bmpinfo = saveBitMap.GetInfo()
+        bmpstr = saveBitMap.GetBitmapBits(True)
+        im = Image.frombuffer('RGB', (bmpinfo['bmWidth'], bmpinfo['bmHeight']), bmpstr, 'raw', 'BGRX', 0, 1)
+        win32gui.DeleteObject(saveBitMap.GetHandle())
+        saveDC.DeleteDC()
+        mfcDC.DeleteDC()
+        win32gui.ReleaseDC(target_hwnd, hwndDC)
+
+        buf = BytesIO()
+        im.save(buf, format='JPEG', quality=85)
+        raw_bytes = buf.getvalue()
+        if is_blank_or_disabled_frame(raw_bytes):
+            return None
+        return raw_bytes
+    except Exception as e:
+        return None
+
 
 def ensure_adb_forward(local_port: int = 8085, remote_port: int = 8080, target_serial: Optional[str] = None) -> bool:
     """Ensures that ADB port forwarding from PC local_port to Android remote_port is actively configured."""
@@ -397,6 +449,8 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
         self._battery_level = 80
         self.picture_path = Path(picture_path or "data/tab_a11_picture.jpg")
         self._cached_picture: Optional[bytes] = None
+        self._last_frame_bytes: Optional[bytes] = None
+        self._last_frame_time: float = 0.0
 
     @property
     def battery_life(self) -> int:
@@ -411,6 +465,9 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
         return -40
 
     def get_health(self) -> Dict[str, Any]:
+        has_fresh_web = bool(self._last_frame_bytes and (time.time() - self._last_frame_time < 6.0))
+        has_dshow = bool(self.broadcaster and self.broadcaster.latest_frame and not is_blank_or_disabled_frame(self.broadcaster.latest_frame))
+        is_stream = has_fresh_web or has_dshow
         return {
             "battery_percentage": self._battery_level,
             "battery_percentage_category": "good",
@@ -421,8 +478,8 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
             "is_phone": True,
             "is_local": True,
             "is_windows_link": True,
-            "is_streaming": True,
-            "uses_pictures": False
+            "is_streaming": is_stream,
+            "uses_pictures": not is_stream
         }
 
     def get_picture(self) -> Optional[bytes]:
@@ -462,6 +519,12 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
 
     async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
         """Captures frame from stream if valid/live; otherwise returns assigned picture."""
+        # 1. Direct Web Browser stream (from /mobile_cam?cam=tab)
+        if self._last_frame_bytes and (time.time() - self._last_frame_time < 6.0):
+            if not is_blank_or_disabled_frame(self._last_frame_bytes):
+                return self._last_frame_bytes
+
+        # 2. Windows Virtual Camera (DirectShow Index 2)
         if self.broadcaster:
             self.broadcaster.start()
             frame = self.broadcaster.latest_frame
@@ -473,7 +536,16 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
                 if frame and not is_blank_or_disabled_frame(frame):
                     return frame
 
-        # Fallback to clear assigned picture
+        # 3. Desktop window screen capture of Phone Link mirroring ("Galaxy Tab A11+")
+        win_frame = capture_desktop_window_frame("Galaxy Tab A11+") or capture_desktop_window_frame("Tab A11")
+        if win_frame and not is_blank_or_disabled_frame(win_frame):
+            return win_frame
+
+        # 4. Fallback to cached browser frame if valid
+        if self._last_frame_bytes and not is_blank_or_disabled_frame(self._last_frame_bytes):
+            return self._last_frame_bytes
+
+        # 5. Fallback to clear assigned picture
         pic = self.get_picture()
         if pic:
             return pic
@@ -520,6 +592,8 @@ class AndroidPhoneCamera:
             target_device_serial=self.target_device_serial
         )
         self.broadcaster.start()
+        self.dshow_broadcaster = LocalWebcamBroadcaster(camera_index=self.camera_index, backend=cv2.CAP_DSHOW)
+        self.dshow_broadcaster.start()
         self._poll_thread = threading.Thread(target=self._battery_poll_loop, daemon=True)
         self._poll_thread.start()
 
@@ -723,7 +797,10 @@ class AndroidPhoneCamera:
         return -45
 
     def get_health(self) -> Dict[str, Any]:
-        is_stream = bool(hasattr(self, "broadcaster") and self.broadcaster and self.broadcaster.is_live)
+        has_fresh_web = bool(self._last_frame_bytes and (time.time() - self._last_frame_time < 6.0))
+        has_dshow = bool(hasattr(self, "dshow_broadcaster") and self.dshow_broadcaster and self.dshow_broadcaster.latest_frame and not is_blank_or_disabled_frame(self.dshow_broadcaster.latest_frame))
+        has_mjpeg = bool(hasattr(self, "broadcaster") and self.broadcaster and self.broadcaster.is_live and self.broadcaster.latest_frame and not is_blank_or_disabled_frame(self.broadcaster.latest_frame))
+        is_stream = has_fresh_web or has_dshow or has_mjpeg
         return {
             "battery_percentage": self._battery_level,
             "battery_percentage_category": "good" if self._battery_level > 20 else "low",
@@ -795,56 +872,44 @@ class AndroidPhoneCamera:
         return buf.getvalue()
 
     async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
-        """Fetches fresh snapshot: prioritizes live broadcaster/HTTP shot if active and non-blank; falls back to picture."""
-        if not self._orientation_initialized and self.stream_url:
-            self._orientation_initialized = True
-            asyncio.create_task(self.async_set_orientation("landscape"))
+        """Fetches fresh snapshot: prioritizes live web stream, DirectShow virtual cam, IP broadcaster; falls back to picture."""
+        # 1. Direct Web Browser stream (from /mobile_cam?cam=s21)
+        if self._last_frame_bytes and (time.time() - self._last_frame_time < 6.0):
+            if not is_blank_or_disabled_frame(self._last_frame_bytes):
+                return self._last_frame_bytes
 
-        # 0. Broadcaster 30 FPS buffer (Real-time Instant Snapshot)
-        if hasattr(self, "broadcaster") and self.broadcaster:
-            self.broadcaster.start()
+        # 2. Windows Virtual Camera (DirectShow Index 1 - Sean's S22 Ultra (Windows Virtual Camera))
+        if hasattr(self, "dshow_broadcaster") and self.dshow_broadcaster:
+            self.dshow_broadcaster.start()
+            f = self.dshow_broadcaster.latest_frame
+            if f and not is_blank_or_disabled_frame(f):
+                return f
+            for _ in range(2):
+                await asyncio.sleep(0.03)
+                f = self.dshow_broadcaster.latest_frame
+                if f and not is_blank_or_disabled_frame(f):
+                    return f
+
+        # 3. Broadcaster 30 FPS buffer (Real-time Instant Snapshot from IP Webcam)
+        if hasattr(self, "broadcaster") and self.broadcaster and self.broadcaster.is_live:
             if self.broadcaster.latest_frame and not is_blank_or_disabled_frame(self.broadcaster.latest_frame):
                 return self.broadcaster.latest_frame
 
-        # 1. Direct HTTP snapshot fetch with active endpoint prioritization
-        candidate_urls = [f"http://127.0.0.1:{self.adb_port}/shot.jpg"]
-        for w in self.wifi_candidates:
-            w_shot = w.replace("/video", "/shot.jpg")
-            if w_shot not in candidate_urls:
-                candidate_urls.append(w_shot)
-        if self.stream_url:
-            active_shot = self.stream_url.replace("/video", "/shot.jpg")
-            if active_shot in candidate_urls:
-                candidate_urls.remove(active_shot)
-            candidate_urls.insert(0, active_shot)
+        # 4. Desktop window screen capture of Phone Link mirroring ("S21" or "S22")
+        win_frame = capture_desktop_window_frame("S21") or capture_desktop_window_frame("S22")
+        if win_frame and not is_blank_or_disabled_frame(win_frame):
+            return win_frame
 
-        async with httpx.AsyncClient(timeout=1.2) as client:
-            for shot_url in candidate_urls:
-                try:
-                    resp = await client.get(shot_url)
-                    if resp.status_code == 200 and len(resp.content) > 1000 and not is_blank_or_disabled_frame(resp.content):
-                        self._last_frame_bytes = resp.content
-                        self._last_frame_time = time.time()
-                        working_stream = shot_url.replace("/shot.jpg", "/video")
-                        if working_stream != self.stream_url:
-                            logger.info(f"⚡ {self.name} stream auto-switched to active link: {working_stream}")
-                            self.stream_url = working_stream
-                            if hasattr(self, "broadcaster") and self.broadcaster:
-                                self.broadcaster.stream_url = working_stream
-                        return resp.content
-                except Exception:
-                    continue
-
-        # 2. Fallback to last known frame if valid and non-blank
+        # 5. Last frame bytes if available
         if self._last_frame_bytes and not is_blank_or_disabled_frame(self._last_frame_bytes):
             return self._last_frame_bytes
 
-        # 3. Always fallback to the assigned picture
+        # 6. Always fallback to the assigned picture
         pic = self.get_picture()
         if pic:
             return pic
 
-        # 4. Standby frame
+        # 7. Standby frame
         return self._generate_standby_frame()
 
 
@@ -1122,11 +1187,16 @@ class RingManager:
             
             is_streaming = False
             if is_tab:
-                is_streaming = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.latest_frame is not None)
+                has_fresh_web = bool(getattr(cam, "_last_frame_bytes", None) and (time.time() - getattr(cam, "_last_frame_time", 0.0) < 6.0))
+                has_dshow = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.latest_frame and not is_blank_or_disabled_frame(cam.broadcaster.latest_frame))
+                is_streaming = has_fresh_web or has_dshow
             elif is_local:
                 is_streaming = True
             elif is_phone:
-                is_streaming = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.is_live)
+                has_fresh_web = bool(getattr(cam, "_last_frame_bytes", None) and (time.time() - getattr(cam, "_last_frame_time", 0.0) < 6.0))
+                has_dshow = bool(hasattr(cam, "dshow_broadcaster") and cam.dshow_broadcaster and cam.dshow_broadcaster.latest_frame and not is_blank_or_disabled_frame(cam.dshow_broadcaster.latest_frame))
+                has_mjpeg = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.is_live and cam.broadcaster.latest_frame and not is_blank_or_disabled_frame(cam.broadcaster.latest_frame))
+                is_streaming = has_fresh_web or has_dshow or has_mjpeg
 
             results.append({
                 "name": name,

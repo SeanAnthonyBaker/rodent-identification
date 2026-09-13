@@ -33,7 +33,7 @@ class RolandInferenceClient:
 
     def __init__(
         self,
-        endpoint_url: str = "http://localhost:11434",
+        endpoint_url: str = "http://roland3:11434",
         endpoint_type: str = "ollama",
         model_name: str = "tulkah_gemma4_12b:latest",
         confidence_threshold: float = 0.45,
@@ -437,10 +437,7 @@ class RolandInferenceClient:
             async with self._lock:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                     if self.endpoint_type == "ollama":
-                        endpoint = self.endpoint_url
-                        if "roland3" in endpoint:
-                            endpoint = "http://localhost:11434"
-                        url = f"{endpoint}/api/generate"
+                        url = f"{self.endpoint_url}/api/generate"
                         payload = {
                             "model": self.model_name,
                             "prompt": prompt,
@@ -454,16 +451,9 @@ class RolandInferenceClient:
                                 "seed": 42
                             }
                         }
-                        try:
-                            resp = await client.post(url, json=payload)
-                            resp.raise_for_status()
-                        except Exception as e:
-                            if "localhost" not in url:
-                                logger.warning(f"Failed reaching {url}, falling back to local Ollama on http://localhost:11434: {e}")
-                                resp = await client.post("http://localhost:11434/api/generate", json=payload)
-                                resp.raise_for_status()
-                            else:
-                                raise e
+                        logger.info(f"⚡ Dispatching AI inference to Roland 3: {url} (model={self.model_name})")
+                        resp = await client.post(url, json=payload)
+                        resp.raise_for_status()
                         data = resp.json()
                         raw_text = data.get("response", "")
 

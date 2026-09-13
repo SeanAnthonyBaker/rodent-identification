@@ -23,8 +23,14 @@
     </div>
     
     <div class="flex items-center gap-2">
+      <!-- Device Selector (S21 vs Tab A11+) -->
+      <select id="mobileDeviceSelect" class="bg-slate-950 text-amber-300 text-xs font-bold border border-slate-700 rounded-lg px-2.5 py-1 focus:border-amber-500 focus:outline-none">
+        <option value="Samsung Galaxy S21 Ultra">📱 S21 Ultra</option>
+        <option value="Galaxy Tab A11+">📟 Tab A11+</option>
+      </select>
+
       <!-- Mobile Target Selector -->
-      <select id="mobileTargetSelect" class="bg-slate-950 text-amber-300 text-xs font-bold border border-slate-700 rounded-lg px-2.5 py-1 focus:border-amber-500 focus:outline-none">
+      <select id="mobileTargetSelect" class="bg-slate-950 text-emerald-300 text-xs font-bold border border-slate-700 rounded-lg px-2.5 py-1 focus:border-emerald-500 focus:outline-none">
         <option value="all">🌐 All</option>
         <option value="rat">🐀 Rat</option>
         <option value="bird">🐦 Bird</option>
@@ -41,10 +47,15 @@
 
   <!-- Video Preview Canvas -->
   <main class="relative flex-1 my-3 bg-black rounded-2xl border border-slate-800 overflow-hidden flex items-center justify-center">
+    <!-- Front / Back Quick Flip Overlay -->
+    <button id="btnOverlayFlipCamera" type="button" class="absolute top-4 left-4 bg-slate-900/85 hover:bg-slate-800 border border-slate-700 text-amber-300 px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-lg active:scale-95 transition z-20" title="Switch Front / Back Camera View">
+      <span>🔄</span> <span id="overlayFlipCameraLabel">Back (Rear) Cam</span>
+    </button>
+
     <video id="videoPreview" autoplay playsinline muted class="w-full h-full object-cover scale-y-[1.40] origin-center"></video>
     
     <!-- Motion Alert Overlay -->
-    <div id="motionAlert" class="hidden absolute top-4 right-4 bg-red-600/90 text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-lg animate-pulse flex items-center gap-1.5">
+    <div id="motionAlert" class="hidden absolute top-4 right-4 bg-red-600/90 text-white font-bold text-xs px-3 py-1.5 rounded-xl shadow-lg animate-pulse flex items-center gap-1.5 z-20">
       <span id="motionAlertIcon">🚨</span> <span id="motionAlertText">Scanning Movement...</span>
     </div>
 
@@ -56,7 +67,7 @@
     </div>
 
     <!-- Live Telemetry Overlays -->
-    <div class="absolute bottom-4 left-4 bg-black/75 backdrop-blur border border-slate-800 px-3 py-1 rounded-lg text-xs font-mono text-slate-300 flex items-center gap-2">
+    <div class="absolute bottom-4 left-4 bg-black/75 backdrop-blur border border-slate-800 px-3 py-1 rounded-lg text-xs font-mono text-slate-300 flex items-center gap-2 z-20">
       <span id="resolutionLabel">1080p 30fps</span>
       <span>•</span>
       <span id="fpsLabel" class="text-amber-400">Sent: 0</span>
@@ -65,20 +76,35 @@
 
   <!-- Bottom Controls -->
   <footer class="bg-slate-900/90 border border-slate-800 p-4 rounded-2xl backdrop-blur flex flex-col gap-3">
-    <!-- Lens / Zoom Quick Controls -->
+    <!-- Lens / Flip Controls -->
     <div class="flex items-center justify-between gap-2">
-      <span class="text-xs text-slate-400 font-semibold">Optical Lens:</span>
       <div class="flex items-center gap-1.5">
-        <button class="btn-lens px-3 py-1 bg-amber-600 text-white text-xs font-bold rounded-lg transition" data-zoom="1.0">1x Main</button>
-        <button class="btn-lens px-3 py-1 bg-slate-800 hover:bg-slate-700 active:bg-amber-600 text-xs font-bold rounded-lg transition" data-zoom="3.0">3x Tele</button>
-        <button class="btn-lens px-3 py-1 bg-slate-800 hover:bg-slate-700 active:bg-amber-600 text-xs font-bold rounded-lg transition" data-zoom="10.0">10x Super</button>
+        <span class="text-xs text-slate-400 font-semibold">Lens:</span>
+        <button class="btn-lens px-2.5 py-1 bg-amber-600 text-white text-xs font-bold rounded-lg transition" data-zoom="1.0">1x</button>
+        <button class="btn-lens px-2.5 py-1 bg-slate-800 hover:bg-slate-700 active:bg-amber-600 text-xs font-bold rounded-lg transition" data-zoom="3.0">3x</button>
+        <button class="btn-lens px-2.5 py-1 bg-slate-800 hover:bg-slate-700 active:bg-amber-600 text-xs font-bold rounded-lg transition" data-zoom="10.0">10x</button>
       </div>
+      <!-- Flip Front / Back Button -->
+      <button id="btnFlipCamera" type="button" class="px-3 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1 active:scale-95 shadow" title="Switch between Rear (Back) and Front (Selfie) camera">
+        <span>🔄</span> <span id="flipCameraLabel">Rear Cam</span>
+      </button>
     </div>
 
     <!-- Main Start/Stop Stream Button -->
     <button id="btnToggleBroadcast" class="w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 active:scale-98 text-white font-bold text-sm rounded-xl transition flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/20">
       <span>📹</span> <span id="btnToggleText">Start Streaming Rear Camera</span>
     </button>
+
+    <!-- Picture Mode Controls -->
+    <div class="grid grid-cols-2 gap-2">
+      <button id="btnSnapPicture" type="button" class="py-2.5 bg-sky-600 hover:bg-sky-500 active:scale-98 text-white font-bold text-xs rounded-xl transition flex items-center justify-center gap-1.5 shadow">
+        <span>📸</span> <span id="btnSnapText">Snap &amp; Set Picture</span>
+      </button>
+      <label class="py-2.5 bg-slate-800 hover:bg-slate-700 active:scale-98 text-slate-200 border border-slate-700 font-bold text-xs rounded-xl transition flex items-center justify-center gap-1.5 shadow cursor-pointer text-center">
+        <span>📁</span> <span>Upload Picture</span>
+        <input type="file" id="inputUploadPicture" accept="image/*" class="hidden" />
+      </label>
+    </div>
   </footer>
 
 
@@ -93,6 +119,21 @@
     const resolutionLabel = document.getElementById("resolutionLabel");
     const fpsLabel = document.getElementById("fpsLabel");
     const lensButtons = document.querySelectorAll(".btn-lens");
+    const btnFlipCamera = document.getElementById("btnFlipCamera");
+    const flipCameraLabel = document.getElementById("flipCameraLabel");
+    const btnOverlayFlipCamera = document.getElementById("btnOverlayFlipCamera");
+    const overlayFlipCameraLabel = document.getElementById("overlayFlipCameraLabel");
+
+    const mobileDeviceSelect = document.getElementById("mobileDeviceSelect");
+    const urlParams = new URLSearchParams(window.location.search);
+    const camParam = (urlParams.get("cam") || urlParams.get("device") || "").toLowerCase();
+    if (mobileDeviceSelect) {
+      if (camParam.includes("tab") || camParam.includes("a11")) {
+        mobileDeviceSelect.value = "Galaxy Tab A11+";
+      } else if (camParam.includes("s21") || camParam.includes("phone")) {
+        mobileDeviceSelect.value = "Samsung Galaxy S21 Ultra";
+      }
+    }
 
     let currentStream = null;
     let isBroadcasting = false;
@@ -102,6 +143,7 @@
     let sentFrameCount = 0;
     let phoneBatteryPct = null;
     let isPhoneCharging = false;
+    let currentFacingMode = "environment"; // "environment" = Rear/Back, "user" = Front/Selfie
 
     if (typeof navigator.getBattery === "function") {
       navigator.getBattery().then(bat => {
@@ -115,6 +157,40 @@
         });
       }).catch(() => {});
     }
+
+    async function flipCamera() {
+      currentFacingMode = (currentFacingMode === "environment") ? "user" : "environment";
+      const isRear = (currentFacingMode === "environment");
+      const name = isRear ? "Rear Cam" : "Front Cam";
+      if (flipCameraLabel) flipCameraLabel.textContent = name;
+      if (overlayFlipCameraLabel) overlayFlipCameraLabel.textContent = name;
+
+      if (!isBroadcasting) {
+        btnToggleText.textContent = `Start Streaming ${isRear ? "Rear" : "Front"} Camera`;
+        return;
+      }
+
+      // Hot-swap stream seamlessly while broadcasting
+      try {
+        if (currentStream) {
+          currentStream.getTracks().forEach(t => t.stop());
+        }
+        currentStream = await getCameraStream();
+        videoPreview.srcObject = currentStream;
+        await videoPreview.play();
+
+        track = currentStream.getVideoTracks()[0];
+        const settings = track.getSettings ? track.getSettings() : {};
+        if (settings.width && settings.height) {
+          resolutionLabel.textContent = `${settings.width}x${settings.height} @ ${settings.frameRate || 30}fps`;
+        }
+      } catch (err) {
+        console.error("Camera flip error:", err);
+      }
+    }
+
+    if (btnFlipCamera) btnFlipCamera.addEventListener("click", flipCamera);
+    if (btnOverlayFlipCamera) btnOverlayFlipCamera.addEventListener("click", flipCamera);
 
     btnToggleBroadcast.addEventListener("click", toggleBroadcast);
 
@@ -131,11 +207,13 @@
         throw new Error("getUserMedia is not supported on this browser or context. Please ensure you are visiting via HTTPS (https://...).");
       }
 
-      // Try environment rear camera with full HD first
+      const facingConstraint = { ideal: currentFacingMode };
+
+      // Try full HD with preferred facing mode
       try {
         return await navigator.mediaDevices.getUserMedia({
           video: {
-            facingMode: { ideal: "environment" },
+            facingMode: facingConstraint,
             width: { ideal: 1920 },
             height: { ideal: 1080 },
             frameRate: { ideal: 30 }
@@ -143,17 +221,17 @@
           audio: false
         });
       } catch (e1) {
-        console.warn("Tier 1 camera constraints failed, trying generic environment...", e1);
+        console.warn("Tier 1 camera constraints failed, trying basic facing...", e1);
       }
 
-      // Try basic environment camera
+      // Try basic facing mode
       try {
         return await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
+          video: { facingMode: facingConstraint },
           audio: false
         });
       } catch (e2) {
-        console.warn("Tier 2 camera constraints failed, trying standard video...", e2);
+        console.warn("Tier 2 camera constraints failed, trying generic video...", e2);
       }
 
       // Fallback to any available video stream
@@ -244,7 +322,7 @@
           signal: controller.signal,
           body: JSON.stringify({
             image_base64: b64,
-            device_name: `Samsung Galaxy S21 Ultra (${currentZoom}x)`,
+            device_name: `${mobileDeviceSelect ? mobileDeviceSelect.value : "Samsung Galaxy S21 Ultra"} (${currentZoom}x)`,
             battery_percentage: phoneBatteryPct,
             is_charging: isPhoneCharging
           })
@@ -318,6 +396,62 @@
         }
       });
     });
+
+    const btnSnapPicture = document.getElementById("btnSnapPicture");
+    const btnSnapText = document.getElementById("btnSnapText");
+    const inputUploadPicture = document.getElementById("inputUploadPicture");
+
+    async function uploadPictureBlob(blob) {
+      btnSnapText.textContent = "Uploading...";
+      btnSnapPicture.disabled = true;
+      try {
+        const fd = new FormData();
+        fd.append("file", blob, "s21_snap.jpg");
+        const res = await fetch("/api/camera/Samsung Galaxy S21 Ultra/upload_picture", {
+          method: "POST",
+          body: fd
+        });
+        if (res.ok) {
+          btnSnapText.textContent = "✅ Picture Set!";
+          setTimeout(() => { btnSnapText.textContent = "Snap & Set Picture"; btnSnapPicture.disabled = false; }, 2000);
+        } else {
+          alert("Failed to upload: " + res.statusText);
+          btnSnapText.textContent = "Snap & Set Picture";
+          btnSnapPicture.disabled = false;
+        }
+      } catch (e) {
+        alert("Upload error: " + e.message);
+        btnSnapText.textContent = "Snap & Set Picture";
+        btnSnapPicture.disabled = false;
+      }
+    }
+
+    if (btnSnapPicture) {
+      btnSnapPicture.addEventListener("click", async () => {
+        if (videoPreview && videoPreview.videoWidth > 0) {
+          const snapCanvas = document.createElement("canvas");
+          snapCanvas.width = videoPreview.videoWidth;
+          snapCanvas.height = videoPreview.videoHeight;
+          const sCtx = snapCanvas.getContext("2d");
+          sCtx.drawImage(videoPreview, 0, 0, snapCanvas.width, snapCanvas.height);
+          snapCanvas.toBlob(blob => {
+            if (blob) uploadPictureBlob(blob);
+          }, "image/jpeg", 0.92);
+        } else {
+          // If video not active, open file chooser directly
+          inputUploadPicture.click();
+        }
+      });
+    }
+
+    if (inputUploadPicture) {
+      inputUploadPicture.addEventListener("change", (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) {
+          uploadPictureBlob(file);
+        }
+      });
+    }
   </script>
 </body>
 </html>

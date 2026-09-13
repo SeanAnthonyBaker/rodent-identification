@@ -712,11 +712,23 @@ async def live_camera_stream(camera_name: str):
                     try:
                         frame = await asyncio.wait_for(q.get(), timeout=1.0)
                     except asyncio.TimeoutError:
-                        frame = target_cam.broadcaster.latest_frame
-                    if is_blank_or_disabled_frame(frame) and pic_fallback:
-                        frame = pic_fallback
+                        frame = target_cam.broadcaster.latest_frame if (hasattr(target_cam, "broadcaster") and target_cam.broadcaster) else None
+                    if is_blank_or_disabled_frame(frame):
+                        # Try DirectShow virtual camera if available (e.g. S21 / S22)
+                        if hasattr(target_cam, "dshow_broadcaster") and target_cam.dshow_broadcaster and target_cam.dshow_broadcaster.latest_frame:
+                            df = target_cam.dshow_broadcaster.latest_frame
+                            if not is_blank_or_disabled_frame(df):
+                                frame = df
+                        # Try fresh web browser push frame (/mobile_cam)
+                        if is_blank_or_disabled_frame(frame) and getattr(target_cam, "_last_frame_bytes", None):
+                            last_t = getattr(target_cam, "_last_frame_time", 0.0)
+                            if time.time() - last_t < 6.0:
+                                frame = target_cam._last_frame_bytes
+                        # Fallback to high-res picture
+                        if is_blank_or_disabled_frame(frame) and pic_fallback:
+                            frame = pic_fallback
                     if not frame:
-                        frame = ring_manager.create_standby_frame(f"{real_cam_name} Reconnecting (Check USB)...", real_cam_name)
+                        frame = ring_manager.create_standby_frame(f"{real_cam_name} Reconnecting...", real_cam_name)
 
                     now = time.time()
                     if frame and (now - last_sent >= 0.05):
@@ -941,12 +953,27 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
     now_dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 1. Update cache & active camera instantly
-    if hasattr(ring_manager, "_phone_cam"):
-        ring_manager._phone_cam._last_frame_bytes = image_bytes
-        ring_manager._phone_cam._last_frame_time = now_time
+    dev_name_lower = (payload.device_name or "").lower()
+    is_tab = "tab" in dev_name_lower or "a11" in dev_name_lower
+
+    if is_tab and hasattr(ring_manager, "_tab_cam"):
+        target_device = ring_manager._tab_cam
+        target_device._last_frame_bytes = image_bytes
+        target_device._last_frame_time = now_time
         if payload.battery_percentage is not None:
-            ring_manager._phone_cam.battery_life = payload.battery_percentage
+            target_device.battery_life = payload.battery_percentage
+            logger.info(f"🔋 Updated Tab A11+ battery level from live stream telemetry: {payload.battery_percentage}%")
+        ring_manager._snapshot_cache["Galaxy Tab A11+"] = image_bytes
+        ring_manager._snapshot_cache["Tab A11+"] = image_bytes
+    elif hasattr(ring_manager, "_phone_cam"):
+        target_device = ring_manager._phone_cam
+        target_device._last_frame_bytes = image_bytes
+        target_device._last_frame_time = now_time
+        if payload.battery_percentage is not None:
+            target_device.battery_life = payload.battery_percentage
             logger.info(f"🔋 Updated S21 battery level from live stream telemetry: {payload.battery_percentage}%")
+        ring_manager._snapshot_cache["Samsung Galaxy S21 Ultra"] = image_bytes
+        ring_manager._snapshot_cache["S21"] = image_bytes
         if ring_manager._active_camera != ring_manager._phone_cam:
             ring_manager._active_camera = ring_manager._phone_cam
             logger.info("Auto-switched active camera to Samsung Galaxy S21 Ultra from live stream.")
@@ -1304,20 +1331,8 @@ async def get_cameras_zone_summary():
         has_zone = poly is not None and len(poly) >= 3
         is_sel = (cam_name.lower() == (active_cam_name or "").lower())
         is_mobile = any(k in cam_name.lower() for k in ["s21", "tab", "galaxy", "phone", "tablet"])
-        target_cam = ring_manager.find_camera(cam_name)
-        is_streaming = False
-        if target_cam:
-            from src.ring_client import LocalRolandCamera, AndroidPhoneCamera, GalaxyTabWindowsCamera
-            if isinstance(target_cam, GalaxyTabWindowsCamera):
-                f = target_cam.broadcaster.latest_frame if (hasattr(target_cam, "broadcaster") and target_cam.broadcaster) else None
-                if not f:
-                    f = getattr(target_cam, "_last_frame_bytes", None)
-                is_streaming = (f is not None and not is_blank_or_disabled_frame(f))
-            elif isinstance(target_cam, LocalRolandCamera):
-                is_streaming = True
-            elif isinstance(target_cam, AndroidPhoneCamera):
-                last_t = getattr(target_cam, "_last_frame_time", 0.0)
-                is_streaming = (time.time() - last_t < 10.0) or bool(hasattr(target_cam, "broadcaster") and target_cam.broadcaster and target_cam.broadcaster.is_live)
+        is_streaming = c.get("is_streaming", False)
+        uses_pictures = c.get("uses_pictures", is_mobile and not is_streaming)
 
         results.append({
             "name": cam_name,

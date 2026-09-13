@@ -1,0 +1,59 @@
+version: "3.8"
+
+# ==============================================================================
+# ROLAND 3 DEPLOYMENT STACK
+# Dedicated High-Throughput AI Inference Compute Node
+# ==============================================================================
+
+services:
+  # 1. Ollama Multimodal Serving Engine (roland3 Port 11434)
+  ollama-inference:
+    image: ollama/ollama:latest
+    container_name: roland3-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_FLASH_ATTENTION=1
+
+  # 2. Optional vLLM High-Speed Gemma 4 26B Engine (roland3 Port 8000)
+  vllm-inference:
+    image: vllm/vllm-openai:latest
+    container_name: roland3-vllm-gemma4
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - /models:/model:ro
+    command: >
+      /model/gemma-4-26b-a4b-nvfp4
+      --served-model-name gemma4-26b
+      --max-model-len 8192
+      --max-num-seqs 4
+      --gpu-memory-utilization 0.70
+      --moe-backend marlin
+      --kv-cache-dtype fp8
+      --enforce-eager false
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+
+volumes:
+  ollama-models:
