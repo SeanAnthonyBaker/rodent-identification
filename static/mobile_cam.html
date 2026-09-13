@@ -39,6 +39,10 @@
         <option value="horses_poo">🐴💩 Horses poo</option>
       </select>
 
+      <span id="wakeLockBadge" class="hidden text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded-full font-mono flex items-center gap-1">
+        ☀️ Awake
+      </span>
+
       <span id="streamStatusBadge" class="text-xs bg-slate-800 text-slate-400 px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5">
         <span class="w-2 h-2 rounded-full bg-slate-500"></span> Standby
       </span>
@@ -182,6 +186,42 @@
     let phoneBatteryPct = null;
     let isPhoneCharging = false;
     let currentFacingMode = "environment"; // "environment" = Rear/Back, "user" = Front/Selfie
+    let wakeLock = null;
+
+    async function requestWakeLock() {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLock = await navigator.wakeLock.request("screen");
+          console.log("☀️ Screen Wake Lock acquired - tablet display will remain on.");
+          const badge = document.getElementById("wakeLockBadge");
+          if (badge) badge.classList.remove("hidden");
+          wakeLock.addEventListener("release", () => {
+            wakeLock = null;
+            const b = document.getElementById("wakeLockBadge");
+            if (b) b.classList.add("hidden");
+          });
+        }
+      } catch (err) {
+        console.warn("Wake lock request error:", err);
+      }
+    }
+
+    async function releaseWakeLock() {
+      if (wakeLock !== null) {
+        try {
+          await wakeLock.release();
+        } catch (e) {}
+        wakeLock = null;
+      }
+      const b = document.getElementById("wakeLockBadge");
+      if (b) b.classList.add("hidden");
+    }
+
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState === "visible" && isBroadcasting && wakeLock === null) {
+        await requestWakeLock();
+      }
+    });
 
     if (typeof navigator.getBattery === "function") {
       navigator.getBattery().then(bat => {
@@ -298,6 +338,7 @@
         }
 
         isBroadcasting = true;
+        await requestWakeLock();
         sentFrameCount = 0;
         streamStatusBadge.className = "text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-2.5 py-1 rounded-full font-mono flex items-center gap-1.5";
         streamStatusBadge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Live Broadcast';
@@ -400,6 +441,7 @@
 
     function stopBroadcast() {
       isBroadcasting = false;
+      releaseWakeLock();
       if (broadcastInterval) clearInterval(broadcastInterval);
       if (currentStream) {
         currentStream.getTracks().forEach(t => t.stop());

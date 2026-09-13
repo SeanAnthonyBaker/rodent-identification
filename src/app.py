@@ -499,8 +499,8 @@ async def test_watch_notification():
 
 @app.post("/api/sample_now")
 async def trigger_sample_now():
-    """Triggers an immediate sample and inference cycle."""
-    asyncio.create_task(sampler_engine.sample_once())
+    """Triggers an immediate sample and AI inference cycle."""
+    asyncio.create_task(sampler_engine.sample_once(force_ai=True))
     return {"status": "Sampling triggered", "active_camera": ring_manager.camera_name}
 
 class TargetObjectPayload(BaseModel):
@@ -508,9 +508,12 @@ class TargetObjectPayload(BaseModel):
 
 @app.post("/api/target_object")
 async def set_target_object(payload: TargetObjectPayload):
-    """Sets the active target object type (tree, bird, rat, horses_poo, all)."""
+    """Sets the active target object type (tree, bird, rat, horses_poo, all) and immediately triggers evaluation."""
     target = payload.target_object.lower().strip()
     inference_client.target_object = target
+    sampler_engine._is_rat_active = False
+    sampler_engine._active_event_id = None
+    sampler_engine._active_event_object = None
     try:
         config_file = Path("config.yaml")
         if config_file.exists():
@@ -531,6 +534,10 @@ async def set_target_object(payload: TargetObjectPayload):
             "target_object": target
         }
     })
+
+    # Immediately trigger an AI vision evaluation with the new target
+    asyncio.create_task(sampler_engine.sample_once(force_ai=True))
+
     return {"success": True, "target_object": target}
 
 @app.post("/api/simulate_detection")
@@ -686,7 +693,11 @@ async def live_camera_stream(camera_name: str):
             try:
                 real_cam_name = getattr(target_cam, "name", camera_name)
                 pic_fallback = target_cam.get_picture() if hasattr(target_cam, "get_picture") else None
-                first_frame = target_cam.broadcaster.latest_frame or getattr(target_cam, "_last_frame_bytes", None)
+                first_frame = None
+                if getattr(target_cam, "_last_frame_bytes", None) and (time.time() - getattr(target_cam, "_last_frame_time", 0.0) < 6.0):
+                    first_frame = target_cam._last_frame_bytes
+                if not first_frame and hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
+                    first_frame = target_cam.broadcaster.latest_frame
                 if is_blank_or_disabled_frame(first_frame) and pic_fallback:
                     first_frame = pic_fallback
                 if not first_frame and hasattr(target_cam, "async_get_snapshot"):
@@ -706,24 +717,30 @@ async def live_camera_stream(camera_name: str):
                     + b"\r\n"
                 )
                 
-                # Smooth broadcast loop capped at ~20 FPS (prevents socket reset & browser decode choke)
+                # Smooth broadcast loop capped at ~20-25 FPS (prevents socket reset & browser decode choke)
                 last_sent = time.time()
                 while True:
-                    try:
-                        frame = await asyncio.wait_for(q.get(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        frame = target_cam.broadcaster.latest_frame if (hasattr(target_cam, "broadcaster") and target_cam.broadcaster) else None
-                    if is_blank_or_disabled_frame(frame):
+                    # Check if camera has an active web stream (/mobile_cam within 6s)
+                    last_web_t = getattr(target_cam, "_last_frame_time", 0.0)
+                    is_web_fresh = (time.time() - last_web_t < 6.0) and (getattr(target_cam, "_last_frame_bytes", None) is not None)
+
+                    if is_web_fresh:
+                        frame = target_cam._last_frame_bytes
+                        has_fresh_web = True
+                        await asyncio.sleep(0.04)  # ~25 FPS pacing for mobile web stream
+                    else:
+                        has_fresh_web = False
+                        try:
+                            frame = await asyncio.wait_for(q.get(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            frame = target_cam.broadcaster.latest_frame if (hasattr(target_cam, "broadcaster") and target_cam.broadcaster) else None
+
+                    if not has_fresh_web and is_blank_or_disabled_frame(frame):
                         # Try DirectShow virtual camera if available (e.g. S21 / S22)
                         if hasattr(target_cam, "dshow_broadcaster") and target_cam.dshow_broadcaster and target_cam.dshow_broadcaster.latest_frame:
                             df = target_cam.dshow_broadcaster.latest_frame
                             if not is_blank_or_disabled_frame(df):
                                 frame = df
-                        # Try fresh web browser push frame (/mobile_cam)
-                        if is_blank_or_disabled_frame(frame) and getattr(target_cam, "_last_frame_bytes", None):
-                            last_t = getattr(target_cam, "_last_frame_time", 0.0)
-                            if time.time() - last_t < 6.0:
-                                frame = target_cam._last_frame_bytes
                         # Fallback to high-res picture
                         if is_blank_or_disabled_frame(frame) and pic_fallback:
                             frame = pic_fallback
@@ -987,7 +1004,13 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
 
     # 2. Check instant motion & target zone material delta
     p = payload.polygon or inference_client.detection_polygon
-    zone_info = sampler_engine.motion_pipeline.compute_zone_delta(image_bytes, polygon=p, delta_threshold=0.40)
+    cam_name = payload.device_name or ("Galaxy Tab A11+" if is_tab else "Samsung Galaxy S21 Ultra")
+    zone_info = sampler_engine.motion_pipeline.compute_zone_delta(
+        image_bytes,
+        polygon=p,
+        delta_threshold=0.40,
+        camera_name=cam_name
+    )
     delta_pct = zone_info["delta_percent"]
     has_material_delta = zone_info["has_material_delta"]
 
@@ -998,16 +1021,17 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
         "data": {
             "image_base64": f"data:image/jpeg;base64,{b64_thumb}",
             "timestamp": now_dt_str,
-            "device_name": payload.device_name or ("Galaxy Tab A11+" if is_tab else "Samsung Galaxy S21 Ultra"),
+            "device_name": cam_name,
             "motion_pct": delta_pct,
             "zone_delta_pct": delta_pct,
             "has_material_delta": has_material_delta
         }
     }))
 
-    # 4. Trigger AI: ONLY when material delta occurs inside target zone (delta >= 0.4% with 2s cooldown)
+    # 4. Trigger AI: when material delta occurs inside target zone OR periodically every >= 8s to catch foraging/stationary wildlife
     global _last_stream_ai_time, _is_analyzing_stream
-    should_run_ai = not _is_analyzing_stream and has_material_delta and (now_time - _last_stream_ai_time >= 2.0)
+    time_since_stream_ai = now_time - _last_stream_ai_time
+    should_run_ai = not _is_analyzing_stream and (has_material_delta or (time_since_stream_ai >= 8.0)) and (time_since_stream_ai >= 2.0)
 
     if should_run_ai:
         _is_analyzing_stream = True
@@ -1016,7 +1040,7 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
         async def _run_async_ai(img_b, dev_name, poly, z_info):
             global _is_analyzing_stream
             try:
-                ref_b = sampler_engine.motion_pipeline.get_reference_baseline()
+                ref_b = sampler_engine.motion_pipeline.get_reference_baseline() if "Garden" in dev_name else None
                 crop_b = z_info["focused_crop_bytes"]
                 crop_bbox = z_info["crop_bbox"]
                 is_subcrop = crop_bbox is not None
@@ -1504,7 +1528,12 @@ async def update_settings(payload: SettingsPayload):
     if payload.confidence_threshold is not None:
         inference_client.confidence_threshold = payload.confidence_threshold
     if payload.target_object is not None:
-        inference_client.target_object = payload.target_object.lower().strip()
+        new_target = payload.target_object.lower().strip()
+        if new_target != inference_client.target_object:
+            sampler_engine._is_rat_active = False
+            sampler_engine._active_event_id = None
+            sampler_engine._active_event_object = None
+        inference_client.target_object = new_target
     if payload.gemini_api_key is not None:
         inference_client.gemini_api_key = payload.gemini_api_key.strip()
     if payload.gemini_model is not None:

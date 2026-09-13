@@ -180,7 +180,9 @@ class MotionCascadePipeline:
         self,
         current_bytes: bytes,
         polygon: Optional[List[List[float]]] = None,
-        delta_threshold: float = 0.40
+        delta_threshold: float = 0.40,
+        reference_bytes: Optional[bytes] = None,
+        camera_name: Optional[str] = None
     ) -> Dict[str, Any]:
         """Compares current frame directly against the locked baseline reference specifically in the target zone."""
         nparr = np.frombuffer(current_bytes, np.uint8)
@@ -196,9 +198,13 @@ class MotionCascadePipeline:
 
         h, w = curr_img.shape[:2]
         roi_mask = self.get_roi_mask((h, w), polygon)
-        ref_bytes = self.get_reference_baseline()
 
-        # If no reference image exists, use MOG2 background subtractor
+        # Baseline comparison: only use reference baseline if explicitly provided, or if camera is Garden
+        ref_bytes = reference_bytes
+        if ref_bytes is None and (camera_name is None or camera_name == "Garden"):
+            ref_bytes = self.get_reference_baseline()
+
+        # If no reference image exists (or camera is not Garden), use adaptive MOG2 background subtractor
         if not ref_bytes:
             return self.process_frame(current_bytes, polygon)
 

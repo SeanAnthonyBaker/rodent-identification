@@ -462,6 +462,18 @@ function initStreamWatchdog() {
     streamRetryCount = 0;
     resizeRoiCanvas();
   };
+
+  // Periodic Watchdog: Ensure live stream maintains fresh data
+  setInterval(() => {
+    if (isRealtimeLiveActive && mainCameraFeedImg && mainCameraFeedImg.src && mainCameraFeedImg.src.includes("/live_stream")) {
+      // If image is naturalWidth 0 or complete is false for > 5s, reconnect
+      if (mainCameraFeedImg.naturalWidth === 0 && streamRetryCount < 3) {
+        console.warn("Watchdog detected frozen or stalled live stream, reconnecting...");
+        const cam = currentSelectedCamera || "Garden";
+        mainCameraFeedImg.src = `/api/camera/${encodeURIComponent(cam)}/live_stream?t=${Date.now()}`;
+      }
+    }
+  }, 5000);
 }
 
 function selectCameraByName(name) {
@@ -1192,6 +1204,20 @@ async function setTargetObject(target) {
     visionActiveTargetLabel.textContent = `${meta.icon} ${meta.label}`;
   }
 
+  // Clear previous target tracking overlays and update watchdog status badge
+  lastDetectedTargetBox = null;
+  lastDetectedTargetLabel = null;
+  lastDetectedTargetType = null;
+  lastDetectedTargetConf = null;
+  lastDetectedTargetTime = 0;
+  if (samplingStatusText) {
+    samplingStatusText.textContent = `🎯 Monitoring for ${meta.label}`;
+    samplingStatusText.className = "text-xs font-medium text-amber-300";
+    if (livePulse) livePulse.className = "animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75";
+    if (liveDot) liveDot.className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500";
+  }
+  renderRoiCanvas();
+
   try {
     await fetch("/api/target_object", {
       method: "POST",
@@ -1631,17 +1657,30 @@ function initWebSocket() {
           currentTargetObject = t;
           if (headerTargetSelect) headerTargetSelect.value = t;
           if (settingTargetObject) settingTargetObject.value = t;
+          const labels = {
+            all: "🌐 All Objects",
+            rat: "🐀 Rat",
+            bird: "🐦 Bird",
+            tree: "🌲 Tree",
+            horse: "🐴 Horse",
+            horses_poo: "🐴💩 Horses poo"
+          };
           if (visionActiveTargetLabel) {
-            const labels = {
-              all: "🌐 All Objects",
-              rat: "🐀 Rat",
-              bird: "🐦 Bird",
-              tree: "🌲 Tree",
-              horse: "🐴 Horse",
-              horses_poo: "🐴💩 Horses poo"
-            };
             visionActiveTargetLabel.textContent = labels[t] || t;
           }
+          // Clear any active target tracking overlays from previous species
+          lastDetectedTargetBox = null;
+          lastDetectedTargetLabel = null;
+          lastDetectedTargetType = null;
+          lastDetectedTargetConf = null;
+          lastDetectedTargetTime = 0;
+          if (samplingStatusText) {
+            samplingStatusText.textContent = `🎯 Monitoring for ${labels[t] || t}`;
+            samplingStatusText.className = "text-xs font-medium text-amber-300";
+            if (livePulse) livePulse.className = "animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75";
+            if (liveDot) liveDot.className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500";
+          }
+          renderRoiCanvas();
         }
         return;
       }
@@ -1706,7 +1745,11 @@ function initWebSocket() {
         if (payload.object_boundary && payload.is_animal !== false) {
           lastDetectedTargetBox = payload.object_boundary;
           lastDetectedTargetTime = Date.now();
-          if (!lastDetectedTargetLabel || lastDetectedTargetLabel === "Detecting Animal...") {
+          const curTarget = (currentTargetObject || "all").toLowerCase();
+          const targetMatchesType = curTarget === "all" ||
+            (lastDetectedTargetType && (lastDetectedTargetType.includes(curTarget) || curTarget.includes(lastDetectedTargetType)));
+
+          if (!targetMatchesType || !lastDetectedTargetLabel || lastDetectedTargetLabel === "Detecting Animal...") {
             lastDetectedTargetLabel = "Detecting Animal...";
             lastDetectedTargetType = "candidate_animal";
             lastDetectedTargetConf = null;
@@ -1775,9 +1818,14 @@ function initWebSocket() {
 
         // Update header indicator badge
         if (samplingStatusText) {
-          if (payload.is_boosted || isHit) {
+          if (isHit) {
             samplingStatusText.textContent = `⚡ Tracking ${tagLabel}`;
             samplingStatusText.className = "text-xs font-bold text-amber-400 animate-pulse";
+            if (livePulse) livePulse.className = "animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75";
+            if (liveDot) liveDot.className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500";
+          } else if (payload.is_boosted) {
+            samplingStatusText.textContent = `⚡ Motion Active in Zone`;
+            samplingStatusText.className = "text-xs font-semibold text-amber-300 animate-pulse";
             if (livePulse) livePulse.className = "animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75";
             if (liveDot) liveDot.className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500";
           } else {
@@ -3379,9 +3427,9 @@ function drawTargetReticle(ctx, cx, cy, label, type, conf, strokeCol, tagEmoji, 
 function renderDetectedTargetBoundingBox(ctx, w, h, box, label, type, conf) {
   if (!box || box.length < 4) return;
 
-  // ONLY bound an object when it could be an animal
-  const nonAnimalTypes = ["clutter", "false_positive_clutter", "none", "shadow", "foliage", "clear", "manure", "horses_poo"];
-  if (type && nonAnimalTypes.includes(type.toLowerCase())) {
+  // ONLY bound an object when it is a recognized target
+  const nonTargetTypes = ["clutter", "false_positive_clutter", "none", "shadow", "foliage", "clear"];
+  if (type && nonTargetTypes.includes(type.toLowerCase())) {
     return;
   }
 

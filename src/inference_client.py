@@ -532,16 +532,28 @@ class RolandInferenceClient:
                     norm_label = "None"
                     desc_low = desc.lower()
 
-                    # Check for explicit negation in the model's explanation
-                    negation_phrases = [
-                        "not a rat", "not a rodent", "no rat", "no rodent",
-                        "not a live rat", "not a live rodent", "not a specified target",
-                        "lacks the distinct anatomical", "lacks discernible", "lacks the anatomical",
-                        "classified as false positive", "false positive clutter", "is general clutter",
-                        "domestic cat", "is a cat", "cat is present", "a cat and", "cat on a",
-                        "a dog", "is a dog", "domestic dog", "pet"
-                    ]
-                    is_negation = any(neg in desc_low for neg in negation_phrases)
+                    # Target-aware negation checks
+                    is_negation = False
+                    if target_mode in ["rat", "rodent", "rats", "mouse"]:
+                        rat_negations = [
+                            "not a rat", "not a rodent", "no rat", "no rodent",
+                            "not a live rat", "not a live rodent", "not a specified target",
+                            "lacks the distinct anatomical", "lacks discernible", "lacks the anatomical",
+                            "classified as false positive", "false positive clutter", "is general clutter"
+                        ]
+                        is_negation = any(neg in desc_low for neg in rat_negations)
+                    elif target_mode in ["bird", "birds", "pheasant"]:
+                        bird_negations = ["not a bird", "no bird", "not a live bird", "no avian", "classified as false positive", "false positive clutter"]
+                        is_negation = any(neg in desc_low for neg in bird_negations)
+                    elif target_mode in ["horses_poo", "horse_poo", "horses poo", "poo", "manure"]:
+                        poo_negations = ["not horse poo", "not manure", "no horse poo", "no manure", "clean lawn", "clean ground"]
+                        is_negation = any(neg in desc_low for neg in poo_negations)
+
+                    # If model classified as other_animal but target is bird and description mentions bird, promote to bird
+                    if raw_type in ["other_animal", "animal"] and target_mode in ["bird", "birds", "pheasant", "all"]:
+                        if any(b_word in desc_low for b_word in ["bird", "pheasant", "pigeon", "avian", "songbird", "sparrow", "thrush", "foraging on the grass", "lawn"]):
+                            raw_type = "bird"
+                            raw_detected = True
 
                     # 1. Non-target categories or detected false positives
                     if raw_type in ["false_positive_clutter", "clutter", "statue", "furniture", "sofa"]:

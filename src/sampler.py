@@ -97,7 +97,7 @@ class SamplerEngine:
             except Exception as e:
                 logger.error(f"Error in subscriber callback: {e}")
 
-    async def sample_once(self) -> Dict[str, Any]:
+    async def sample_once(self, force_ai: bool = False) -> Dict[str, Any]:
         """Executes a single sampling cycle with OpenCV background subtraction and high-res sub-crop inference."""
         self._sample_count += 1
         start_ts = datetime.now()
@@ -122,7 +122,7 @@ class SamplerEngine:
 
         detection_saved = None
 
-        if is_standby:
+        if is_standby and not force_ai:
             inference_result = DetectionResult(
                 detected=False,
                 is_detected=False,
@@ -137,7 +137,7 @@ class SamplerEngine:
             self._latest_inference_result = inference_result
             self._is_rat_active = False
             self.current_interval_seconds = self.base_interval_seconds
-        elif not is_new and not self.ring._is_mock and not isinstance(self.ring._active_camera, LocalRolandCamera):
+        elif not is_new and not force_ai and not self.ring._is_mock and not isinstance(self.ring._active_camera, LocalRolandCamera):
             # Same static event file from before: skip redundant inference
             inference_result = DetectionResult(
                 detected=False,
@@ -167,7 +167,8 @@ class SamplerEngine:
             zone_info = self.motion_pipeline.compute_zone_delta(
                 snapshot_bytes,
                 polygon=self.inference.detection_polygon,
-                delta_threshold=0.35
+                delta_threshold=0.35,
+                camera_name=self.ring.camera_name
             )
             has_animal_candidate = fast_result["has_candidates"] and fast_result.get("is_animal", False)
             has_delta = zone_info["has_material_delta"] or has_animal_candidate
@@ -176,8 +177,8 @@ class SamplerEngine:
             # ONLY bound an object when it could be an animal
             object_boundary = primary_box if has_animal_candidate else None
 
-            ref_bytes = self.motion_pipeline.get_reference_baseline()
-            if not ref_bytes and not self.ring._is_mock:
+            ref_bytes = self.motion_pipeline.get_reference_baseline() if self.ring.camera_name == "Garden" else None
+            if not ref_bytes and not self.ring._is_mock and self.ring.camera_name == "Garden":
                 self.motion_pipeline.save_reference_baseline(snapshot_bytes)
                 ref_bytes = snapshot_bytes
 
@@ -209,14 +210,18 @@ class SamplerEngine:
                 })
 
             # --- STAGE 2: BRING AI VISION ENGINE INTO PLAY (NON-BLOCKING ASYNC CASCADE) ---
-            if has_delta:
-                # Dispatch focused high-res crop to Gemini / Gemma Vision Engine asynchronously without blocking fast detector
-                now_t = time.time()
-                if not self._ai_task_running and (now_t - self._last_ai_dispatch >= 1.5):
+            now_t = time.time()
+            time_since_ai = now_t - getattr(self, "_last_ai_dispatch", 0.0)
+            # Run AI if forced, or motion/animal candidate, or periodically every >= 10 seconds to catch stationary/foraging wildlife
+            should_run_ai = force_ai or has_delta or (time_since_ai >= 10.0)
+            if should_run_ai:
+                if force_ai or not self._ai_task_running:
                     self._last_ai_dispatch = now_t
+                    # Only pass ref_bytes if camera is Ring Garden where reference was captured; otherwise evaluate high-res scene directly
+                    valid_ref = ref_bytes if (ref_bytes and self.ring.camera_name == "Garden") else None
                     asyncio.create_task(self._run_async_ai_inference(
                         crop_bytes=crop_bytes,
-                        ref_bytes=ref_bytes,
+                        ref_bytes=valid_ref,
                         is_subcrop=is_subcrop,
                         crop_bbox=crop_bbox,
                         zone_info=zone_info,
@@ -269,10 +274,12 @@ class SamplerEngine:
         """Asynchronously calls Gemini / Gemma multimodal AI, saves detection, and updates UI."""
         self._ai_task_running = True
         try:
+            # Guard: baseline contrast reference image only applies to Ring Garden camera
+            active_ref = ref_bytes if (self.ring.camera_name == "Garden") else None
             inference_result = await self.inference.analyze_image(
                 image_bytes=crop_bytes,
                 polygon=self.inference.detection_polygon,
-                reference_image_bytes=ref_bytes,
+                reference_image_bytes=active_ref,
                 is_subcrop=is_subcrop
             )
 
@@ -301,15 +308,17 @@ class SamplerEngine:
                         max(0, min(1000, full_ymax)),
                         max(0, min(1000, full_xmax))
                     ]
-            # --- STRICT 85%+ ANIMAL DETERMINATION GATE ---
-            # Only confirm animal and persist/alert if:
-            # 1. Gemma/Gemini confirmed an animal (not foliage, shadow, tree, ground, or clutter)
-            # 2. Confidence score is >= 85% (0.85)
-            min_conf_threshold = 0.85
-            non_animal_types = {"none", "clutter", "shadow", "foliage", "tree", "plant", "ground", "grass"}
+            # --- TARGET DETERMINATION GATE ---
+            # Confirm target and persist/alert if confidence meets threshold
+            current_target = (self.inference.target_object or "all").lower()
+            min_conf_threshold = getattr(self.inference, "confidence_threshold", 0.70) or 0.70
+            disallowed_types = {"none", "clutter", "false_positive_clutter", "shadow", "foliage", "plant", "ground", "grass"}
+            if current_target != "tree":
+                disallowed_types.add("tree")
+
             is_valid_animal = (
                 inference_result.is_detected
-                and inference_result.object_type.lower() not in non_animal_types
+                and inference_result.object_type.lower() not in disallowed_types
                 and (inference_result.confidence >= min_conf_threshold)
             )
 
@@ -426,8 +435,15 @@ class SamplerEngine:
                 # Pull latest frame from lockless camera buffer
                 active_cam = self.ring._active_camera
                 frame_bytes = None
-                if active_cam and hasattr(active_cam, "broadcaster") and active_cam.broadcaster:
+                # Prioritize active fresh web browser stream (within 6 seconds)
+                if active_cam and getattr(active_cam, "_last_frame_bytes", None):
+                    last_t = getattr(active_cam, "_last_frame_time", 0.0)
+                    if time.time() - last_t < 6.0:
+                        frame_bytes = active_cam._last_frame_bytes
+
+                if not frame_bytes and active_cam and hasattr(active_cam, "broadcaster") and active_cam.broadcaster:
                     frame_bytes = active_cam.broadcaster.latest_frame
+
                 if not frame_bytes and active_cam:
                     frame_bytes = getattr(active_cam, "_last_frame_bytes", None)
                 if not frame_bytes:
@@ -471,7 +487,7 @@ class SamplerEngine:
                             self._last_ai_dispatch = now_t
                             crop_bytes = zone_info.get("focused_crop_bytes", frame_bytes)
                             crop_bbox = zone_info.get("crop_bbox")
-                            ref_bytes = self.motion_pipeline.get_reference_baseline()
+                            ref_bytes = self.motion_pipeline.get_reference_baseline() if self.ring.camera_name == "Garden" else None
                             await self._determination_queue.put({
                                 "crop_bytes": crop_bytes,
                                 "crop_bbox": crop_bbox,
@@ -530,14 +546,8 @@ class SamplerEngine:
         logger.info(f"Starting adaptive sampling engine (Baseline: {self.base_interval_seconds}s, Active Target: {self.active_detection_interval_seconds}s)")
         while self._running:
             try:
-                # Ring cameras / battery devices check snapshots periodically
-                is_fast_broadcaster = bool(
-                    self.ring._active_camera
-                    and hasattr(self.ring._active_camera, "broadcaster")
-                    and self.ring._active_camera.broadcaster is not None
-                )
-                if not is_fast_broadcaster:
-                    await self.sample_once()
+                # Continuously execute periodic AI vision sampling for active camera
+                await self.sample_once()
             except Exception as e:
                 logger.error(f"Error during sampling tick: {e}", exc_info=True)
 
