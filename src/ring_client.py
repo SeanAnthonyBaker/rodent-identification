@@ -15,8 +15,30 @@ import threading
 import cv2
 import httpx
 from PIL import Image, ImageDraw
+import numpy as np
 
 logger = logging.getLogger("ring_client")
+
+
+def is_blank_or_disabled_frame(frame_bytes: Optional[bytes]) -> bool:
+    """Checks whether a frame is pure black or a Windows Link disabled-camera placeholder."""
+    if not frame_bytes or len(frame_bytes) < 100:
+        return True
+    try:
+        nparr = np.frombuffer(frame_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return True
+        mean_val = float(img.mean())
+        if mean_val < 8.0:
+            return True
+        black_ratio = float(np.count_nonzero(img < 15)) / float(img.size)
+        if black_ratio > 0.90 and mean_val < 20.0:
+            return True
+        return False
+    except Exception:
+        return True
+
 
 
 def ensure_adb_forward(local_port: int = 8085, remote_port: int = 8080, target_serial: Optional[str] = None) -> bool:
@@ -366,17 +388,23 @@ class LocalRolandCamera:
 
 
 class GalaxyTabWindowsCamera(LocalRolandCamera):
-    """Ingests live stream from Samsung Galaxy Tab A11+ via Windows Link (Connected Camera)."""
-    def __init__(self, name: str = "Galaxy Tab A11+", camera_index: int = 2):
+    """Ingests live stream or high-resolution picture snapshot from Samsung Galaxy Tab A11+."""
+    def __init__(self, name: str = "Galaxy Tab A11+", camera_index: int = 2, picture_path: Optional[str] = None):
         super().__init__(name=name, camera_index=camera_index, backend=cv2.CAP_DSHOW)
         self.device_id = "tablet-cam-tab-a11"
         self.family = "tablet_cameras"
-        self.model = "Samsung Galaxy Tab A11+ (Windows Link / Connected Camera)"
+        self.model = "Samsung Galaxy Tab A11+ (Picture / Windows Link)"
         self._battery_level = 80
+        self.picture_path = Path(picture_path or "data/tab_a11_picture.jpg")
+        self._cached_picture: Optional[bytes] = None
 
     @property
     def battery_life(self) -> int:
         return self._battery_level
+
+    @battery_life.setter
+    def battery_life(self, val: int):
+        self._battery_level = val
 
     @property
     def wifi_signal_strength(self) -> int:
@@ -392,19 +420,60 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
             "is_mock": False,
             "is_phone": True,
             "is_local": True,
-            "is_windows_link": True
+            "is_windows_link": True,
+            "is_streaming": True,
+            "uses_pictures": False
         }
 
+    def get_picture(self) -> Optional[bytes]:
+        """Loads assigned high-res surveillance picture for Galaxy Tab A11+."""
+        if self._cached_picture:
+            return self._cached_picture
+        candidates = [
+            self.picture_path,
+            Path("data/tab_a11_picture.jpg"),
+            Path("data/video_frames/frame_00s.jpg"),
+            Path("data/current_feed_debug.jpg")
+        ]
+        for p in candidates:
+            if p.exists():
+                try:
+                    b = p.read_bytes()
+                    if len(b) > 1000 and not is_blank_or_disabled_frame(b):
+                        self._cached_picture = b
+                        return b
+                except Exception:
+                    pass
+        return None
+
+    def set_picture(self, image_bytes: bytes) -> bool:
+        """Sets/updates the active picture for Galaxy Tab A11+."""
+        try:
+            self.picture_path.parent.mkdir(parents=True, exist_ok=True)
+            self.picture_path.write_bytes(image_bytes)
+            self._cached_picture = image_bytes
+            return True
+        except Exception as e:
+            logger.error(f"Failed setting picture for {self.name}: {e}")
+            return False
+
     async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
-        """Captures an instant real-time frame directly from Windows Link Virtual Camera."""
+        """Captures frame from stream if valid/live; otherwise returns assigned picture."""
         if self.broadcaster:
             self.broadcaster.start()
-            if self.broadcaster.latest_frame:
-                return self.broadcaster.latest_frame
-            for _ in range(8):
-                await asyncio.sleep(0.05)
-                if self.broadcaster.latest_frame:
-                    return self.broadcaster.latest_frame
+            frame = self.broadcaster.latest_frame
+            if frame and not is_blank_or_disabled_frame(frame):
+                return frame
+            for _ in range(3):
+                await asyncio.sleep(0.04)
+                frame = self.broadcaster.latest_frame
+                if frame and not is_blank_or_disabled_frame(frame):
+                    return frame
+
+        # Fallback to clear assigned picture
+        pic = self.get_picture()
+        if pic:
+            return pic
         return None
 
 
@@ -419,7 +488,8 @@ class AndroidPhoneCamera:
         model: str = "Samsung Galaxy S21 Ultra (Webcam / Wireless Stream)",
         adb_port: int = 8085,
         target_device_serial: Optional[str] = None,
-        wifi_candidates: Optional[List[str]] = None
+        wifi_candidates: Optional[List[str]] = None,
+        picture_path: Optional[str] = None
     ):
         self.name = name
         self.device_id = device_id
@@ -429,6 +499,8 @@ class AndroidPhoneCamera:
         self.adb_port = adb_port
         self.target_device_serial = target_device_serial
         self.wifi_candidates = wifi_candidates or ["http://192.168.1.165:8080/video"]
+        self.picture_path = Path(picture_path or "data/s21_picture.jpg")
+        self._cached_picture: Optional[bytes] = None
         
         # Dynamically probe and select active working endpoint (USB/ADB or Wi-Fi)
         self.stream_url = self._resolve_active_stream_url(stream_url)
@@ -648,6 +720,7 @@ class AndroidPhoneCamera:
         return -45
 
     def get_health(self) -> Dict[str, Any]:
+        is_stream = bool(hasattr(self, "broadcaster") and self.broadcaster and self.broadcaster.is_live)
         return {
             "battery_percentage": self._battery_level,
             "battery_percentage_category": "good" if self._battery_level > 20 else "low",
@@ -656,8 +729,44 @@ class AndroidPhoneCamera:
             "device_id": self.device_id,
             "is_mock": False,
             "is_phone": True,
-            "stream_url": self.stream_url
+            "stream_url": self.stream_url,
+            "is_streaming": is_stream,
+            "uses_pictures": not is_stream
         }
+
+    def get_picture(self) -> Optional[bytes]:
+        """Loads assigned high-res surveillance picture for S21 Ultra."""
+        if self._cached_picture:
+            return self._cached_picture
+        candidates = [
+            self.picture_path,
+            Path("data/s21_picture.jpg"),
+            Path("scratch/s21_landscape.jpg"),
+            Path("scratch/s21_test.jpg")
+        ]
+        for p in candidates:
+            if p.exists():
+                try:
+                    b = p.read_bytes()
+                    if len(b) > 1000 and not is_blank_or_disabled_frame(b):
+                        self._cached_picture = b
+                        return b
+                except Exception:
+                    pass
+        return None
+
+    def set_picture(self, image_bytes: bytes) -> bool:
+        """Sets/updates the active picture for S21 Ultra."""
+        try:
+            self.picture_path.parent.mkdir(parents=True, exist_ok=True)
+            self.picture_path.write_bytes(image_bytes)
+            self._cached_picture = image_bytes
+            self._last_frame_bytes = image_bytes
+            self._last_frame_time = time.time()
+            return True
+        except Exception as e:
+            logger.error(f"Failed setting picture for {self.name}: {e}")
+            return False
 
     def _generate_standby_frame(self) -> bytes:
         img = Image.new("RGB", (1280, 720), color=(15, 23, 42))
@@ -683,7 +792,7 @@ class AndroidPhoneCamera:
         return buf.getvalue()
 
     async def async_get_snapshot(self, **kwargs) -> Optional[bytes]:
-        """Fetches fresh snapshot from device via Broadcaster buffer, direct HTTP shot, or standby card."""
+        """Fetches fresh snapshot: prioritizes live broadcaster/HTTP shot if active and non-blank; falls back to picture."""
         if not self._orientation_initialized and self.stream_url:
             self._orientation_initialized = True
             asyncio.create_task(self.async_set_orientation("landscape"))
@@ -691,10 +800,10 @@ class AndroidPhoneCamera:
         # 0. Broadcaster 30 FPS buffer (Real-time Instant Snapshot)
         if hasattr(self, "broadcaster") and self.broadcaster:
             self.broadcaster.start()
-            if self.broadcaster.latest_frame:
+            if self.broadcaster.latest_frame and not is_blank_or_disabled_frame(self.broadcaster.latest_frame):
                 return self.broadcaster.latest_frame
 
-        # 1. PRIORITY 1: Direct HTTP snapshot fetch with active endpoint prioritization
+        # 1. Direct HTTP snapshot fetch with active endpoint prioritization
         candidate_urls = [f"http://127.0.0.1:{self.adb_port}/shot.jpg"]
         for w in self.wifi_candidates:
             w_shot = w.replace("/video", "/shot.jpg")
@@ -710,7 +819,7 @@ class AndroidPhoneCamera:
             for shot_url in candidate_urls:
                 try:
                     resp = await client.get(shot_url)
-                    if resp.status_code == 200 and len(resp.content) > 1000:
+                    if resp.status_code == 200 and len(resp.content) > 1000 and not is_blank_or_disabled_frame(resp.content):
                         self._last_frame_bytes = resp.content
                         self._last_frame_time = time.time()
                         working_stream = shot_url.replace("/shot.jpg", "/video")
@@ -723,11 +832,16 @@ class AndroidPhoneCamera:
                 except Exception:
                     continue
 
-        # 2. PRIORITY 2: Fallback to last known frame if live fetch temporarily failed
-        if self._last_frame_bytes:
+        # 2. Fallback to last known frame if valid and non-blank
+        if self._last_frame_bytes and not is_blank_or_disabled_frame(self._last_frame_bytes):
             return self._last_frame_bytes
 
-        # 3. PRIORITY 3: Clean standby display card
+        # 3. Always fallback to the assigned picture
+        pic = self.get_picture()
+        if pic:
+            return pic
+
+        # 4. Standby frame
         return self._generate_standby_frame()
 
 
@@ -805,7 +919,6 @@ class RingManager:
         )
         self._all_cameras = [self._local_cam, self._phone_cam, self._tab_cam]
         self._snapshot_cache: Dict[str, bytes] = {}
-        self._snapshot_timestamps: Dict[str, float] = {}
         self._last_event_ids: Dict[str, str] = {}
         self._last_vod_trigger_times: Dict[str, float] = {}
 
@@ -889,13 +1002,22 @@ class RingManager:
             name = getattr(cam, "name", "Camera")
             if "outhouse" in name.lower():
                 continue
-            is_local = isinstance(cam, LocalRolandCamera)
+            is_tab = isinstance(cam, GalaxyTabWindowsCamera) or "tab" in name.lower()
+            is_local = isinstance(cam, LocalRolandCamera) and not is_tab
             is_phone = isinstance(cam, AndroidPhoneCamera)
-            is_ring = not is_local and not is_phone and not self._is_mock
+            is_ring = not is_local and not is_phone and not is_tab and not self._is_mock
             bat = getattr(cam, "battery_life", None)
             if is_local: bat = 100
-            elif is_phone: bat = getattr(cam, "battery_life", 80)
+            elif is_phone or is_tab: bat = getattr(cam, "battery_life", 80)
             
+            is_streaming = False
+            if is_tab:
+                is_streaming = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.latest_frame is not None)
+            elif is_local:
+                is_streaming = True
+            elif is_phone:
+                is_streaming = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.is_live)
+
             results.append({
                 "name": name,
                 "id": getattr(cam, "id", None) or getattr(cam, "device_id", None),
@@ -904,7 +1026,9 @@ class RingManager:
                 "wifi_signal_strength": getattr(cam, "wifi_signal_strength", None),
                 "is_ring": is_ring,
                 "is_local": is_local,
-                "is_phone": is_phone,
+                "is_phone": is_phone or is_tab,
+                "is_streaming": is_streaming,
+                "uses_pictures": (is_phone or is_tab) and not is_streaming,
                 "is_active": (self._active_camera and self._active_camera.name.lower() == cam.name.lower())
             })
         return results
@@ -1048,20 +1172,6 @@ class RingManager:
             return None, False, False
 
         cam_name = getattr(cam, "name", "unknown")
-        dev_id = getattr(cam, "_attrs", {}).get("id") or getattr(cam, "id", None)
-
-        # 1. Fetch live cloud snapshot directly from Ring API (fast ~140ms, always fresh daytime/nighttime)
-        cloud_snap = None
-        if dev_id and self._ring:
-            try:
-                from ring_doorbell.const import SNAPSHOT_ENDPOINT
-                resp = await self._ring.async_query(SNAPSHOT_ENDPOINT.format(dev_id))
-                if resp and resp.status_code == 200 and len(resp.content) > 1000:
-                    cloud_snap = resp.content
-            except Exception as e:
-                logger.debug(f"Direct cloud snapshot error for {cam_name}: {e}")
-
-        # 2. Check for newly recorded motion events (for HD 1080p event detection)
         try:
             if self._ring:
                 try:
@@ -1069,62 +1179,83 @@ class RingManager:
                 except Exception:
                     pass
 
-            history = await cam.async_history(limit=2)
-            if history:
-                latest_event = history[0]
-                event_id = str(latest_event.get("id"))
-                prev_event_id = self._last_event_ids.get(cam_name)
-                is_new = (prev_event_id != event_id)
+            history = await cam.async_history(limit=5)
+            if not history:
+                return self.create_standby_frame("No recorded events found", cam_name), True, False
 
-                if is_new:
-                    self._last_event_ids[cam_name] = event_id
-                    url = await cam.async_recording_url(latest_event["id"])
-                    if url:
-                        async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
-                            resp = await client.get(url)
-                            if resp.status_code == 200 and len(resp.content) > 0:
-                                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                                    tmp.write(resp.content)
-                                    tmp_path = tmp.name
+            # Find the most recent event with an accessible recording URL
+            valid_event = None
+            url = None
+            for event in history:
+                e_id = event.get("id")
+                if not e_id:
+                    continue
+                try:
+                    u = await cam.async_recording_url(e_id)
+                    if u:
+                        valid_event = event
+                        url = u
+                        break
+                except Exception:
+                    pass
 
-                                try:
-                                    cap = cv2.VideoCapture(tmp_path)
-                                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
-                                    mid_frame_idx = max(0, total_frames // 2)
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_idx)
-                                    ret, frame = cap.read()
-                                    if not ret:
-                                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                                        ret, frame = cap.read()
-                                    cap.release()
+            if not valid_event or not url:
+                cached = self._snapshot_cache.get(cam_name)
+                return cached or self.create_standby_frame("Awaiting new recording", cam_name), False, False
 
-                                    if ret and frame is not None:
-                                        success, encoded_jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                                        if success:
-                                            frame_bytes = encoded_jpg.tobytes()
-                                            self._snapshot_cache[cam_name] = frame_bytes
-                                            self._snapshot_timestamps[cam_name] = time.time()
-                                            logger.info(f"New Ring motion event on {cam_name} (ID: {event_id}). Extracted HD frame ({frame.shape[1]}x{frame.shape[0]}).")
-                                            return frame_bytes, False, True
-                                finally:
-                                    try:
-                                        Path(tmp_path).unlink(missing_ok=True)
-                                    except Exception:
-                                        pass
+            event_id = str(valid_event.get("id"))
+            prev_event_id = self._last_event_ids.get(cam_name)
+            is_new = (prev_event_id != event_id)
+
+            # If this event was already downloaded and processed, reuse cached frame instantly
+            if not is_new and cam_name in self._snapshot_cache:
+                last_vod = self._last_vod_trigger_times.get(cam_name, 0.0)
+                if time.time() - last_vod > 20:
+                    self._last_vod_trigger_times[cam_name] = time.time()
+                    asyncio.create_task(self.async_trigger_on_demand_recording(cam))
+                return self._snapshot_cache[cam_name], False, False
+
+            self._last_event_ids[cam_name] = event_id
+
+            async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200 or len(resp.content) == 0:
+                    cached = self._snapshot_cache.get(cam_name)
+                    return cached or self.create_standby_frame("Connecting to camera...", cam_name), False, False
+
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                    tmp.write(resp.content)
+                    tmp_path = tmp.name
+
+                try:
+                    cap = cv2.VideoCapture(tmp_path)
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
+                    mid_frame_idx = max(0, total_frames // 2)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_idx)
+                    ret, frame = cap.read()
+                    if not ret:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ret, frame = cap.read()
+                    cap.release()
+
+                    if ret and frame is not None:
+                        success, encoded_jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                        if success:
+                            frame_bytes = encoded_jpg.tobytes()
+                            self._snapshot_cache[cam_name] = frame_bytes
+                            if is_new:
+                                logger.info(f"New Ring motion event on {cam_name} (ID: {event_id}). Extracted frame ({frame.shape[1]}x{frame.shape[0]}).")
+                            return frame_bytes, False, is_new
+                finally:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
         except Exception as e:
             logger.warning(f"Failed extracting frame from Ring recording for {cam_name}: {e}")
-
-        # If we got a fresh live cloud snapshot, cache and return it
-        if cloud_snap:
-            self._snapshot_cache[cam_name] = cloud_snap
-            self._snapshot_timestamps[cam_name] = time.time()
-            return cloud_snap, False, False
-
+        
         cached = self._snapshot_cache.get(cam_name)
-        if cached:
-            return cached, False, False
-
-        return self.create_standby_frame("Standby", cam_name), True, False
+        return cached, False, False
 
     async def async_fetch_snapshot(self, camera_name: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str], bool, bool]:
         """Fetches latest snapshot from specified camera or active camera. Returns (bytes, error, is_standby, is_new)."""
@@ -1141,42 +1272,65 @@ class RingManager:
         cam_name = getattr(target_cam, "name", "Camera")
 
         try:
-            # Case 1: Local Roland 1 Camera or Android Phone Camera
+            # Case 1: Local Roland 1 Camera, Android Phone Camera, or Galaxy Tab Camera
             if isinstance(target_cam, (LocalRolandCamera, AndroidPhoneCamera)):
                 snap = await target_cam.async_get_snapshot()
-                if snap:
+                if snap and not is_blank_or_disabled_frame(snap):
                     self._snapshot_cache[cam_name] = snap
-                    self._snapshot_timestamps[cam_name] = time.time()
                     if camera_name:
                         self._snapshot_cache[camera_name] = snap
-                        self._snapshot_timestamps[camera_name] = time.time()
                     if isinstance(target_cam, AndroidPhoneCamera):
                         if "s21" in cam_name.lower():
                             self._snapshot_cache["S21"] = snap
-                            self._snapshot_timestamps["S21"] = time.time()
                         elif any(k in cam_name.lower() for k in ["tab", "a11"]):
                             self._snapshot_cache["Galaxy Tab A11+"] = snap
                             self._snapshot_cache["Tab A11+"] = snap
-                            self._snapshot_timestamps["Galaxy Tab A11+"] = time.time()
-                            self._snapshot_timestamps["Tab A11+"] = time.time()
                     return snap, None, False, True
+
+                # If snap returned blank/disabled, attempt picture fallback
+                if hasattr(target_cam, "get_picture"):
+                    pic = target_cam.get_picture()
+                    if pic and not is_blank_or_disabled_frame(pic):
+                        self._snapshot_cache[cam_name] = pic
+                        if camera_name:
+                            self._snapshot_cache[camera_name] = pic
+                        return pic, None, False, True
+
                 return None, f"Could not open stream for {target_cam.name}", False, False
 
             # Case 2: Mock Camera
             if self._is_mock or isinstance(target_cam, MockRingCamera):
                 snap = await target_cam.async_get_snapshot()
                 self._snapshot_cache[cam_name] = snap
-                self._snapshot_timestamps[cam_name] = time.time()
                 return snap, None, False, True
 
-            # Case 3: Live Ring Camera snapshot / event frame
+            # Case 3: Live Ring Camera snapshot via Ring Snapshot Cloud Endpoint
+            doorbot_id = getattr(target_cam, "_attrs", {}).get("id") or getattr(target_cam, "id", None)
+            if doorbot_id and self._ring:
+                try:
+                    from ring_doorbell.const import SNAPSHOT_ENDPOINT, SNAPSHOT_TIMESTAMP_ENDPOINT
+                    snap_resp = await self._ring.async_query(SNAPSHOT_ENDPOINT.format(doorbot_id))
+                    if snap_resp.status_code == 200 and len(snap_resp.content) > 2000:
+                        snap_bytes = snap_resp.content
+                        self._snapshot_cache[cam_name] = snap_bytes
+                        if camera_name:
+                            self._snapshot_cache[camera_name] = snap_bytes
+                        try:
+                            asyncio.create_task(self._ring.async_query(SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json={"doorbot_ids": [doorbot_id]}))
+                        except Exception:
+                            pass
+                        logger.info(f"📸 Live daylight Ring snapshot refreshed for {cam_name} ({len(snap_bytes)} bytes)")
+                        return snap_bytes, None, False, True
+                except Exception as e:
+                    logger.debug(f"Direct Ring snapshot query failed for {cam_name}: {e}")
+
+            # Case 4: Live Ring Camera event frame fallback
             rec_frame, is_standby, is_new = await self._fetch_frame_from_latest_recording(target_cam)
-            if rec_frame:
+            if rec_frame and not is_blank_or_disabled_frame(rec_frame):
                 self._snapshot_cache[cam_name] = rec_frame
-                self._snapshot_timestamps[cam_name] = time.time()
                 return rec_frame, None, is_standby, is_new
 
-            if cam_name in self._snapshot_cache:
+            if cam_name in self._snapshot_cache and not is_blank_or_disabled_frame(self._snapshot_cache[cam_name]):
                 return self._snapshot_cache[cam_name], None, False, False
 
             standby = self.create_standby_frame("Standby", cam_name)
@@ -1184,7 +1338,7 @@ class RingManager:
 
         except Exception as e:
             logger.error(f"Error capturing snapshot for {cam_name}: {e}")
-            if cam_name in self._snapshot_cache:
+            if cam_name in self._snapshot_cache and not is_blank_or_disabled_frame(self._snapshot_cache[cam_name]):
                 return self._snapshot_cache[cam_name], None, False, False
             return None, str(e), False, False
 

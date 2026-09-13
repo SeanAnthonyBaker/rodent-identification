@@ -3586,6 +3586,7 @@ const tileZoomState = {}; // camName -> { scale: 1.0, originX: 50, originY: 50 }
 
 let zoneConsoleTimer = null;
 let fastLiveZoneTimer = null;
+const tileInFlight = {};
 
 async function initZoneConsole() {
   await refreshZoneConsole();
@@ -3593,7 +3594,32 @@ async function initZoneConsole() {
   zoneConsoleTimer = setInterval(refreshZoneConsole, 3500);
 
   if (fastLiveZoneTimer) clearInterval(fastLiveZoneTimer);
-  fastLiveZoneTimer = setInterval(refreshFastLiveTiles, 1000);
+  fastLiveZoneTimer = setInterval(refreshFastLiveTiles, 250);
+}
+
+function getCameraStatusPillHtml(cam) {
+  if (cam.is_streaming) {
+    return cam.has_zone
+      ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-950/90 text-rose-300 border border-rose-500/70 flex items-center gap-1.5 whitespace-nowrap shadow-[0_0_8px_rgba(244,63,94,0.35)]">
+          <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>LIVE ZONE
+        </span>`
+      : `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-950/90 text-rose-300 border border-rose-500/70 flex items-center gap-1.5 whitespace-nowrap shadow-[0_0_8px_rgba(244,63,94,0.35)]">
+          <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>LIVE
+        </span>`;
+  }
+  if (cam.has_zone) {
+    return `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
+    </span>`;
+  }
+  if (cam.uses_pictures) {
+    return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700 flex items-center gap-1 whitespace-nowrap">
+      <span>📸</span> Standby Pic
+    </span>`;
+  }
+  return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-emerald-950/80 text-emerald-300 border border-emerald-700/60 flex items-center gap-1 whitespace-nowrap">
+    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
+  </span>`;
 }
 
 function refreshFastLiveTiles() {
@@ -3614,13 +3640,21 @@ function refreshFastLiveTiles() {
     if (!camName || seenCams.has(camName)) return;
     seenCams.add(camName);
 
+    if (tileInFlight[camName]) return;
+
     const img = vp.querySelector("img.zone-crop-img");
     if (img && camName) {
+      tileInFlight[camName] = true;
       const nextSrc = `/api/camera/${encodeURIComponent(camName)}/zone_crop?t=${Date.now()}`;
       const preloader = new Image();
+      const done = () => {
+        tileInFlight[camName] = false;
+      };
       preloader.onload = () => {
         img.src = preloader.src;
+        done();
       };
+      preloader.onerror = done;
       preloader.src = nextSrc;
     }
   });
@@ -3697,17 +3731,7 @@ function renderZoneConsole(cameras, activeCam) {
 
       const pillWrap = tile.querySelector(".zone-status-pill-wrap");
       if (pillWrap) {
-        pillWrap.innerHTML = cam.has_zone
-          ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
-              <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
-            </span>`
-          : cam.uses_pictures
-          ? `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-sky-950/80 text-sky-300 border border-sky-700/60 flex items-center gap-1 whitespace-nowrap">
-              <span>📸</span> Picture
-            </span>`
-          : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-slate-800/90 text-slate-200 border border-slate-700/60 flex items-center gap-1 whitespace-nowrap">
-              <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
-            </span>`;
+        pillWrap.innerHTML = getCameraStatusPillHtml(cam);
       }
       return;
     }
@@ -3753,18 +3777,7 @@ function renderZoneConsole(cameras, activeCam) {
             <span>🔃</span> 180°
           </button>
           <div class="zone-status-pill-wrap">
-            ${cam.has_zone
-              ? `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
-                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
-                </span>`
-              : cam.uses_pictures
-              ? `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-sky-950/80 text-sky-300 border border-sky-700/60 flex items-center gap-1 whitespace-nowrap">
-                  <span>📸</span> Picture
-                </span>`
-              : `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-slate-800/90 text-slate-200 border border-slate-700/60 flex items-center gap-1 whitespace-nowrap">
-                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Online
-                </span>`
-            }
+            ${getCameraStatusPillHtml(cam)}
           </div>
         </div>
       </div>
@@ -3784,7 +3797,7 @@ function renderZoneConsole(cameras, activeCam) {
           <button type="button" class="pointer-events-auto px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-xl flex items-center gap-1 active:scale-95 transition" onclick="selectActiveCamera('${cam.name}')">
             <span>📺</span> Select
           </button>
-          ${cam.uses_pictures ? `
+          ${(cam.uses_pictures && !cam.is_streaming) ? `
           <button type="button" class="pointer-events-auto px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl shadow-xl flex items-center gap-1 active:scale-95 transition" onclick="uploadCameraPicture('${cam.name}')" title="Upload new picture for ${displayName}">
             <span>📸</span> Set Pic
           </button>

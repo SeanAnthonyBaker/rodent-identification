@@ -1308,7 +1308,7 @@ async def get_cameras_zone_summary():
                 is_streaming = True
             elif isinstance(target_cam, AndroidPhoneCamera):
                 last_t = getattr(target_cam, "_last_frame_time", 0.0)
-                is_streaming = (time.time() - last_t < 10.0)
+                is_streaming = (time.time() - last_t < 10.0) or bool(hasattr(target_cam, "broadcaster") and target_cam.broadcaster and target_cam.broadcaster.is_live)
 
         results.append({
             "name": cam_name,
@@ -1319,7 +1319,7 @@ async def get_cameras_zone_summary():
             "is_active": is_sel,
             "is_online": True,
             "is_streaming": is_streaming,
-            "uses_pictures": is_mobile,
+            "uses_pictures": (is_mobile and not is_streaming),
             "battery_percentage": c.get("battery_percentage"),
             "delta_percent": 0.0
         })
