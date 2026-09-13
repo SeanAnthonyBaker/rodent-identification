@@ -432,6 +432,9 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
         candidates = [
             self.picture_path,
             Path("data/tab_a11_picture.jpg"),
+            Path("scratch/live_tab_check.jpg"),
+            Path("scratch/tab_test.jpg"),
+            Path("scratch/tab_crop_test.jpg"),
             Path("data/video_frames/frame_00s.jpg"),
             Path("data/current_feed_debug.jpg")
         ]
@@ -874,6 +877,22 @@ class MockRingCamera:
         }
 
     async def async_get_snapshot(self, **kwargs) -> bytes:
+        candidates = [
+            Path(f"scratch/{self.name}_direct.jpg"),
+            Path(f"scratch/{self.name.lower()}_direct.jpg"),
+            Path(f"scratch/{self.name.lower()}_test.jpg"),
+            Path("scratch/Garden_direct.jpg") if "garden" in self.name.lower() else Path("scratch/cam1_direct.jpg"),
+            Path("scratch/garden_test.jpg") if "garden" in self.name.lower() else Path("scratch/cam1_test.jpg")
+        ]
+        for c in candidates:
+            if c.exists():
+                try:
+                    data = c.read_bytes()
+                    if len(data) > 1000 and not is_blank_or_disabled_frame(data):
+                        return data
+                except Exception:
+                    pass
+
         img = Image.new("RGB", (1280, 720), color=(30, 45, 35))
         draw = ImageDraw.Draw(img)
         draw.rectangle([0, 0, 1280, 240], fill=(20, 30, 45))
@@ -890,6 +909,7 @@ class MockRingCamera:
         return buf.getvalue()
 
 
+
 class RingManager:
     """Manages connections to Ring Cameras (Garden, cam1, etc.) and Local Roland 1 Cameras."""
 
@@ -902,6 +922,8 @@ class RingManager:
         self._active_camera = None
         self._all_cameras = []
         self._is_mock = False
+        self._garden_cam = MockRingCamera("Garden")
+        self._cam1_cam = MockRingCamera("cam1")
         self._local_cam = LocalRolandCamera("Local Camera (Roland 1)", 0)
         from src.config import config
         phone_url = getattr(config.ring, "phone_camera_url", "http://192.168.1.150:8080/video")
@@ -917,10 +939,30 @@ class RingManager:
             name="Galaxy Tab A11+",
             camera_index=2
         )
-        self._all_cameras = [self._local_cam, self._phone_cam, self._tab_cam]
+        # Garden and cam1 are ALWAYS present in _all_cameras from millisecond 0
+        self._all_cameras = [self._garden_cam, self._cam1_cam, self._local_cam, self._phone_cam, self._tab_cam]
+        self._active_camera = self._garden_cam
         self._snapshot_cache: Dict[str, bytes] = {}
         self._last_event_ids: Dict[str, str] = {}
         self._last_vod_trigger_times: Dict[str, float] = {}
+        self._http_session = None
+        self._reconnect_task = None
+
+        # Pre-seed snapshot cache from scratch directory if files exist
+        for cam_key, fpath in [
+            ("Garden", "scratch/Garden_direct.jpg"),
+            ("Garden", "scratch/garden_test.jpg"),
+            ("cam1", "scratch/cam1_direct.jpg"),
+            ("cam1", "scratch/cam1_test.jpg"),
+        ]:
+            p = Path(fpath)
+            if p.exists() and cam_key not in self._snapshot_cache:
+                try:
+                    b = p.read_bytes()
+                    if len(b) > 1000 and not is_blank_or_disabled_frame(b):
+                        self._snapshot_cache[cam_key] = b
+                except Exception:
+                    pass
 
     async def async_trigger_on_demand_recording(self, camera=None):
         """Forces Ring camera to record a fresh on-demand video clip."""
@@ -945,21 +987,71 @@ class RingManager:
         except Exception as e:
             logger.error(f"Failed saving updated Ring token: {e}")
 
+    async def _background_ring_reconnect_loop(self):
+        """Continuously retries connecting to Ring API in background until successful."""
+        logger.info("Starting background Ring reconnect loop...")
+        while True:
+            await asyncio.sleep(10)
+            try:
+                import socket
+                import aiohttp
+                import ring_doorbell.auth as auth_mod
+                from ring_doorbell import Auth, Ring
+
+                auth_mod.TIMEOUT = 45.0
+
+                if self._http_session is None or self._http_session.closed:
+                    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                    timeout = aiohttp.ClientTimeout(total=45, connect=25)
+                    self._http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+                with open(self.token_file, "r", encoding="utf-8") as f:
+                    token_data = json.load(f)
+
+                self._auth = Auth("RodentIdentification/1.0", token_data, self._token_updater, http_client_session=self._http_session)
+                self._ring = Ring(self._auth)
+                await self._ring.async_update_data()
+
+                devices = self._ring.devices()
+                ring_cams = list(devices.stickup_cams) + list(devices.doorbells)
+                ring_cams = [c for c in ring_cams if "outhouse" not in getattr(c, "name", "").lower()]
+
+                for rc in ring_cams:
+                    if "garden" in rc.name.lower():
+                        self._garden_cam = rc
+                    elif "cam1" in rc.name.lower() or "cam 1" in rc.name.lower():
+                        self._cam1_cam = rc
+
+                self._all_cameras = [self._garden_cam, self._cam1_cam, self._local_cam, self._phone_cam, self._tab_cam]
+                self._is_mock = False
+                logger.info(f"✅ Successfully reconnected to Ring API in background! Found {len(ring_cams)} live devices.")
+                break
+            except Exception as e:
+                logger.debug(f"Background Ring reconnect attempt: {e}")
+
     async def async_connect(self):
         """Connects to Ring API and prioritizes Garden and cam1 while filtering out Outhouse."""
-        self._all_cameras = [self._local_cam, self._phone_cam, self._tab_cam]
-
         if not self.token_file.exists():
-            logger.warning(f"Ring token file '{self.token_file}' not found. Defaulting to S21 Ultra.")
-            self._active_camera = self._phone_cam
+            logger.warning(f"Ring token file '{self.token_file}' not found.")
             return
 
         try:
+            import socket
+            import aiohttp
+            import ring_doorbell.auth as auth_mod
             from ring_doorbell import Auth, Ring
+
+            auth_mod.TIMEOUT = 45.0
+
+            if self._http_session is None or self._http_session.closed:
+                connector = aiohttp.TCPConnector(family=socket.AF_INET)
+                timeout = aiohttp.ClientTimeout(total=45, connect=25)
+                self._http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
             with open(self.token_file, "r", encoding="utf-8") as f:
                 token_data = json.load(f)
 
-            self._auth = Auth("RodentIdentification/1.0", token_data, self._token_updater)
+            self._auth = Auth("RodentIdentification/1.0", token_data, self._token_updater, http_client_session=self._http_session)
             self._ring = Ring(self._auth)
             await self._ring.async_update_data()
 
@@ -978,22 +1070,40 @@ class RingManager:
 
             ring_cams.sort(key=_sort_key)
 
+            for rc in ring_cams:
+                if "garden" in rc.name.lower():
+                    self._garden_cam = rc
+                elif "cam1" in rc.name.lower() or "cam 1" in rc.name.lower():
+                    self._cam1_cam = rc
+
             # Combine Ring cameras (first) with Local Roland 1 Camera, S21 Ultra, and Galaxy Tab A11+
-            self._all_cameras = ring_cams + [self._local_cam, self._phone_cam, self._tab_cam]
+            self._all_cameras = [self._garden_cam, self._cam1_cam, self._local_cam, self._phone_cam, self._tab_cam]
 
             # Match active camera
             if self.device_name:
                 matched = self.find_camera(self.device_name)
-                self._active_camera = matched or (ring_cams[0] if ring_cams else self._all_cameras[0])
+                self._active_camera = matched or self._garden_cam
             else:
-                self._active_camera = ring_cams[0] if ring_cams else self._all_cameras[0]
+                self._active_camera = self._garden_cam
 
             self._is_mock = False
             logger.info(f"Connected to Ring API. Discovered {len(ring_cams)} Ring devices: {[c.name for c in ring_cams]}. Total cameras: {[c.name for c in self._all_cameras]}. Active: '{self.camera_name}'")
 
         except Exception as e:
-            logger.error(f"Error connecting to Ring API: {e}", exc_info=True)
-            self._active_camera = self._phone_cam
+            logger.warning(f"Could not connect to Ring API at startup (will retry in background): {e}")
+            # Ensure Garden and cam1 are never dropped
+            if not any("garden" in getattr(c, "name", "").lower() for c in self._all_cameras):
+                self._all_cameras.insert(0, self._garden_cam)
+            if not any("cam1" in getattr(c, "name", "").lower() for c in self._all_cameras):
+                self._all_cameras.insert(1, self._cam1_cam)
+
+            # Launch background reconnect loop
+            if not self._reconnect_task or self._reconnect_task.done():
+                try:
+                    loop = asyncio.get_running_loop()
+                    self._reconnect_task = loop.create_task(self._background_ring_reconnect_loop())
+                except RuntimeError:
+                    pass
 
     def list_cameras(self) -> List[Dict[str, Any]]:
         """Returns all available cameras (Ring Garden, cam1, Galaxy Tab A11+, S21 Ultra, Local Roland)."""
@@ -1047,9 +1157,11 @@ class RingManager:
         if any(k in c_low for k in ["s21", "s1", "phone"]):
             return getattr(self, "_phone_cam", None)
         if "garden" in c_low:
-            return next((c for c in self._all_cameras if "garden" in c.name.lower()), None)
+            m = next((c for c in self._all_cameras if "garden" in c.name.lower()), None)
+            return m or getattr(self, "_garden_cam", None)
         if "cam1" in c_low or "cam 1" in c_low:
-            return next((c for c in self._all_cameras if "cam1" in c.name.lower() or "cam 1" in c.name.lower()), None)
+            m = next((c for c in self._all_cameras if "cam1" in c.name.lower() or "cam 1" in c.name.lower()), None)
+            return m or getattr(self, "_cam1_cam", None)
         if any(k in c_low for k in ["local", "roland", "usb", "webcam"]):
             return getattr(self, "_local_cam", None)
         return None
@@ -1310,11 +1422,16 @@ class RingManager:
                 try:
                     from ring_doorbell.const import SNAPSHOT_ENDPOINT, SNAPSHOT_TIMESTAMP_ENDPOINT
                     snap_resp = await self._ring.async_query(SNAPSHOT_ENDPOINT.format(doorbot_id))
-                    if snap_resp.status_code == 200 and len(snap_resp.content) > 2000:
+                    sc = getattr(snap_resp, "status_code", None) or getattr(snap_resp, "status", None)
+                    if sc == 200 and len(snap_resp.content) > 1000:
                         snap_bytes = snap_resp.content
                         self._snapshot_cache[cam_name] = snap_bytes
                         if camera_name:
                             self._snapshot_cache[camera_name] = snap_bytes
+                        try:
+                            Path(f"scratch/{cam_name}_direct.jpg").write_bytes(snap_bytes)
+                        except Exception:
+                            pass
                         try:
                             asyncio.create_task(self._ring.async_query(SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json={"doorbot_ids": [doorbot_id]}))
                         except Exception:
@@ -1330,8 +1447,26 @@ class RingManager:
                 self._snapshot_cache[cam_name] = rec_frame
                 return rec_frame, None, is_standby, is_new
 
+            # Check in-memory cache
             if cam_name in self._snapshot_cache and not is_blank_or_disabled_frame(self._snapshot_cache[cam_name]):
                 return self._snapshot_cache[cam_name], None, False, False
+
+            # Check disk fallback from scratch
+            candidates = [
+                Path(f"scratch/{cam_name}_direct.jpg"),
+                Path(f"scratch/{cam_name.lower()}_direct.jpg"),
+                Path(f"scratch/{cam_name.lower()}_test.jpg"),
+                Path("scratch/Garden_direct.jpg") if "garden" in cam_name.lower() else Path("scratch/cam1_direct.jpg"),
+            ]
+            for p in candidates:
+                if p.exists():
+                    try:
+                        b = p.read_bytes()
+                        if len(b) > 1000 and not is_blank_or_disabled_frame(b):
+                            self._snapshot_cache[cam_name] = b
+                            return b, None, False, False
+                    except Exception:
+                        pass
 
             standby = self.create_standby_frame("Standby", cam_name)
             return standby, None, True, False

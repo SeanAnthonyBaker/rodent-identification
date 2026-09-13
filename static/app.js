@@ -3797,16 +3797,11 @@ function renderZoneConsole(cameras, activeCam) {
           loading="lazy"
         />
 
-        <!-- Hover Overlay with Select & Upload Buttons -->
-        <div class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-2 pointer-events-none p-2">
-          <button type="button" class="pointer-events-auto px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-xl flex items-center gap-1 active:scale-95 transition" onclick="selectActiveCamera('${cam.name}')">
-            <span>📺</span> Select
+        <!-- Hover Overlay with Select Camera Button -->
+        <div class="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition flex items-center justify-center pointer-events-none p-2">
+          <button type="button" class="pointer-events-auto px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs rounded-xl shadow-xl flex items-center gap-1.5 active:scale-95 transition" onclick="selectActiveCamera('${cam.name}')">
+            <span>📺</span> Select Camera
           </button>
-          ${(cam.uses_pictures && !cam.is_streaming) ? `
-          <button type="button" class="pointer-events-auto px-2.5 py-1.5 bg-sky-600 hover:bg-sky-500 text-white font-bold text-xs rounded-xl shadow-xl flex items-center gap-1 active:scale-95 transition" onclick="uploadCameraPicture('${cam.name}')" title="Upload new picture for ${displayName}">
-            <span>📸</span> Set Pic
-          </button>
-          ` : ""}
         </div>
 
         <!-- Magnification Watermark Badge -->

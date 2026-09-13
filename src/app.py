@@ -747,6 +747,15 @@ async def live_camera_stream(camera_name: str):
             }
         )
 
+    is_phone = bool(
+        target_cam and (
+            getattr(target_cam, "family", "") in ("phone_cameras", "tablet_cameras")
+            or "phone" in getattr(target_cam, "name", "").lower()
+            or "tab" in getattr(target_cam, "name", "").lower()
+            or "s21" in camera_name.lower()
+        )
+    )
+
     async def safe_bg_fetch(cam_name: str):
         try:
             await ring_manager.async_fetch_snapshot(camera_name=cam_name)
