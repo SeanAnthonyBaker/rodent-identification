@@ -805,6 +805,7 @@ class RingManager:
         )
         self._all_cameras = [self._local_cam, self._phone_cam, self._tab_cam]
         self._snapshot_cache: Dict[str, bytes] = {}
+        self._snapshot_timestamps: Dict[str, float] = {}
         self._last_event_ids: Dict[str, str] = {}
         self._last_vod_trigger_times: Dict[str, float] = {}
 
@@ -1047,6 +1048,20 @@ class RingManager:
             return None, False, False
 
         cam_name = getattr(cam, "name", "unknown")
+        dev_id = getattr(cam, "_attrs", {}).get("id") or getattr(cam, "id", None)
+
+        # 1. Fetch live cloud snapshot directly from Ring API (fast ~140ms, always fresh daytime/nighttime)
+        cloud_snap = None
+        if dev_id and self._ring:
+            try:
+                from ring_doorbell.const import SNAPSHOT_ENDPOINT
+                resp = await self._ring.async_query(SNAPSHOT_ENDPOINT.format(dev_id))
+                if resp and resp.status_code == 200 and len(resp.content) > 1000:
+                    cloud_snap = resp.content
+            except Exception as e:
+                logger.debug(f"Direct cloud snapshot error for {cam_name}: {e}")
+
+        # 2. Check for newly recorded motion events (for HD 1080p event detection)
         try:
             if self._ring:
                 try:
@@ -1055,68 +1070,61 @@ class RingManager:
                     pass
 
             history = await cam.async_history(limit=2)
-            if not history:
-                return self.create_standby_frame("No recorded events found", cam_name), True, False
+            if history:
+                latest_event = history[0]
+                event_id = str(latest_event.get("id"))
+                prev_event_id = self._last_event_ids.get(cam_name)
+                is_new = (prev_event_id != event_id)
 
-            latest_event = history[0]
-            event_id = str(latest_event.get("id"))
-            prev_event_id = self._last_event_ids.get(cam_name)
-            is_new = (prev_event_id != event_id)
+                if is_new:
+                    self._last_event_ids[cam_name] = event_id
+                    url = await cam.async_recording_url(latest_event["id"])
+                    if url:
+                        async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+                            resp = await client.get(url)
+                            if resp.status_code == 200 and len(resp.content) > 0:
+                                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                                    tmp.write(resp.content)
+                                    tmp_path = tmp.name
 
-            # If this event was already downloaded and processed, reuse cached frame instantly
-            if not is_new and cam_name in self._snapshot_cache:
-                last_vod = self._last_vod_trigger_times.get(cam_name, 0.0)
-                if time.time() - last_vod > 20:
-                    self._last_vod_trigger_times[cam_name] = time.time()
-                    asyncio.create_task(self.async_trigger_on_demand_recording(cam))
-                return self._snapshot_cache[cam_name], False, False
+                                try:
+                                    cap = cv2.VideoCapture(tmp_path)
+                                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
+                                    mid_frame_idx = max(0, total_frames // 2)
+                                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_idx)
+                                    ret, frame = cap.read()
+                                    if not ret:
+                                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                        ret, frame = cap.read()
+                                    cap.release()
 
-            self._last_event_ids[cam_name] = event_id
-
-            url = await cam.async_recording_url(latest_event["id"])
-            if not url:
-                cached = self._snapshot_cache.get(cam_name)
-                return cached or self.create_standby_frame("Awaiting new recording", cam_name), False, False
-
-            async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
-                resp = await client.get(url)
-                if resp.status_code != 200 or len(resp.content) == 0:
-                    cached = self._snapshot_cache.get(cam_name)
-                    return cached or self.create_standby_frame("Connecting to camera...", cam_name), False, False
-
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                    tmp.write(resp.content)
-                    tmp_path = tmp.name
-
-                try:
-                    cap = cv2.VideoCapture(tmp_path)
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
-                    mid_frame_idx = max(0, total_frames // 2)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_idx)
-                    ret, frame = cap.read()
-                    if not ret:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
-                    cap.release()
-
-                    if ret and frame is not None:
-                        success, encoded_jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-                        if success:
-                            frame_bytes = encoded_jpg.tobytes()
-                            self._snapshot_cache[cam_name] = frame_bytes
-                            if is_new:
-                                logger.info(f"New Ring motion event on {cam_name} (ID: {event_id}). Extracted frame ({frame.shape[1]}x{frame.shape[0]}).")
-                            return frame_bytes, False, is_new
-                finally:
-                    try:
-                        Path(tmp_path).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                                    if ret and frame is not None:
+                                        success, encoded_jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                                        if success:
+                                            frame_bytes = encoded_jpg.tobytes()
+                                            self._snapshot_cache[cam_name] = frame_bytes
+                                            self._snapshot_timestamps[cam_name] = time.time()
+                                            logger.info(f"New Ring motion event on {cam_name} (ID: {event_id}). Extracted HD frame ({frame.shape[1]}x{frame.shape[0]}).")
+                                            return frame_bytes, False, True
+                                finally:
+                                    try:
+                                        Path(tmp_path).unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
         except Exception as e:
             logger.warning(f"Failed extracting frame from Ring recording for {cam_name}: {e}")
-        
+
+        # If we got a fresh live cloud snapshot, cache and return it
+        if cloud_snap:
+            self._snapshot_cache[cam_name] = cloud_snap
+            self._snapshot_timestamps[cam_name] = time.time()
+            return cloud_snap, False, False
+
         cached = self._snapshot_cache.get(cam_name)
-        return cached, False, False
+        if cached:
+            return cached, False, False
+
+        return self.create_standby_frame("Standby", cam_name), True, False
 
     async def async_fetch_snapshot(self, camera_name: Optional[str] = None) -> Tuple[Optional[bytes], Optional[str], bool, bool]:
         """Fetches latest snapshot from specified camera or active camera. Returns (bytes, error, is_standby, is_new)."""
@@ -1138,14 +1146,19 @@ class RingManager:
                 snap = await target_cam.async_get_snapshot()
                 if snap:
                     self._snapshot_cache[cam_name] = snap
+                    self._snapshot_timestamps[cam_name] = time.time()
                     if camera_name:
                         self._snapshot_cache[camera_name] = snap
+                        self._snapshot_timestamps[camera_name] = time.time()
                     if isinstance(target_cam, AndroidPhoneCamera):
                         if "s21" in cam_name.lower():
                             self._snapshot_cache["S21"] = snap
+                            self._snapshot_timestamps["S21"] = time.time()
                         elif any(k in cam_name.lower() for k in ["tab", "a11"]):
                             self._snapshot_cache["Galaxy Tab A11+"] = snap
                             self._snapshot_cache["Tab A11+"] = snap
+                            self._snapshot_timestamps["Galaxy Tab A11+"] = time.time()
+                            self._snapshot_timestamps["Tab A11+"] = time.time()
                     return snap, None, False, True
                 return None, f"Could not open stream for {target_cam.name}", False, False
 
@@ -1153,12 +1166,14 @@ class RingManager:
             if self._is_mock or isinstance(target_cam, MockRingCamera):
                 snap = await target_cam.async_get_snapshot()
                 self._snapshot_cache[cam_name] = snap
+                self._snapshot_timestamps[cam_name] = time.time()
                 return snap, None, False, True
 
-            # Case 3: Live Ring Camera event frame
+            # Case 3: Live Ring Camera snapshot / event frame
             rec_frame, is_standby, is_new = await self._fetch_frame_from_latest_recording(target_cam)
             if rec_frame:
                 self._snapshot_cache[cam_name] = rec_frame
+                self._snapshot_timestamps[cam_name] = time.time()
                 return rec_frame, None, is_standby, is_new
 
             if cam_name in self._snapshot_cache:

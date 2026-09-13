@@ -1104,11 +1104,22 @@ async def get_camera_zone_crop(camera_name: str):
             frame = target_cam.broadcaster.latest_frame
         if not frame and hasattr(target_cam, "latest_frame") and target_cam.latest_frame:
             frame = target_cam.latest_frame
-        if not frame and hasattr(target_cam, "async_get_snapshot"):
+        if not frame and hasattr(target_cam, "async_get_snapshot") and not hasattr(target_cam, "_ring"):
             try:
                 frame = await target_cam.async_get_snapshot()
             except Exception:
                 pass
+
+    # 2. For Ring cameras or non-broadcasters, refresh if cached frame is older than 20 seconds
+    cached_age = time.time() - getattr(ring_manager, "_snapshot_timestamps", {}).get(camera_name, 0.0)
+    has_broadcaster = target_cam and hasattr(target_cam, "broadcaster") and target_cam.broadcaster is not None
+    if (not frame or cached_age > 20.0) and target_cam and not has_broadcaster:
+        try:
+            snap, _, _, _ = await ring_manager.async_fetch_snapshot(camera_name=camera_name)
+            if snap:
+                frame = snap
+        except Exception as e:
+            logger.debug(f"async_fetch_snapshot failed for {camera_name}: {e}")
 
     if not frame:
         frame = ring_manager._snapshot_cache.get(camera_name)
@@ -1117,14 +1128,6 @@ async def get_camera_zone_crop(camera_name: str):
                 if k.lower() == camera_name.lower() or _normalize_cam_key(k) == _normalize_cam_key(camera_name):
                     frame = v
                     break
-
-    if not frame and target_cam:
-        try:
-            snap, _, _, _ = await ring_manager.async_fetch_snapshot(camera_name=camera_name)
-            if snap:
-                frame = snap
-        except Exception as e:
-            logger.debug(f"async_fetch_snapshot failed for {camera_name}: {e}")
 
     no_cache_headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
