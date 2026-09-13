@@ -139,7 +139,7 @@ class SamplerEngine:
             self._latest_inference_result = inference_result
             self._is_rat_active = False
             self.current_interval_seconds = self.base_interval_seconds
-        elif not is_new and not force_ai and not self.ring._is_mock and not isinstance(self.ring._active_camera, LocalRolandCamera):
+        elif not is_new and not force_ai and not self.ring._is_mock and not (type(self.ring._active_camera) is LocalRolandCamera):
             # Same static event file from before: skip redundant inference
             inference_result = DetectionResult(
                 detected=False,

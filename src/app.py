@@ -616,8 +616,15 @@ async def simulate_detection(animal: str = Query("rat", description="'tree', 'bi
     return {"success": True, "detection": record.model_dump()}
 
 
-def apply_live_cctv_hud(image_bytes: bytes, camera_name: str, battery_pct: Optional[int] = None) -> bytes:
-    """Applies a crisp real-time CCTV HUD overlay with ticking clock and pulsing live REC indicator."""
+def apply_live_cctv_hud(
+    image_bytes: bytes,
+    camera_name: str,
+    battery_pct: Optional[int] = None,
+    is_live: bool = True,
+    status_label: Optional[str] = None,
+    timestamp_str: Optional[str] = None
+) -> bytes:
+    """Applies a crisp real-time CCTV HUD overlay with ticking clock for live feeds or clear standby banner for offline snapshots."""
     if not image_bytes:
         return image_bytes
     try:
@@ -628,38 +635,57 @@ def apply_live_cctv_hud(image_bytes: bytes, camera_name: str, battery_pct: Optio
 
         h, w, _ = img.shape
         now = datetime.now()
-        ts_str = now.strftime("%Y-%m-%d %H:%M:%S") + f".{now.microsecond // 100000:01d}"
+        ts_str = timestamp_str or (now.strftime("%Y-%m-%d %H:%M:%S") + f".{now.microsecond // 100000:01d}")
         bat_str = f"{battery_pct}%" if battery_pct is not None else "87%"
 
-        # Pulse state (toggles dot every 500ms)
+        # Pulse state (toggles dot every 500ms) - only pulses when genuinely live
         is_pulse_on = (now.microsecond // 500000) == 0
 
         # Top banner background glass box
         box_h = 38
-        box_w = min(w - 20, 620)
+        box_w = min(w - 20, 680)
         sub_img = img[10:10+box_h, 10:10+box_w]
-        rect = np.full(sub_img.shape, (15, 23, 42), dtype=np.uint8)
+        rect_color = (15, 23, 42) if is_live else (25, 30, 42)
+        rect = np.full(sub_img.shape, rect_color, dtype=np.uint8)
         cv2.addWeighted(sub_img, 0.35, rect, 0.65, 0, sub_img)
 
-        # Draw pulsing Red REC dot
-        dot_color = (0, 0, 240) if is_pulse_on else (40, 40, 110)
-        cv2.circle(img, (28, 29), 6, dot_color, -1)
-        if is_pulse_on:
-            cv2.circle(img, (28, 29), 9, (0, 0, 255), 1)
+        # Draw status dot and title text
+        if is_live:
+            dot_color = (0, 0, 240) if is_pulse_on else (40, 40, 110)
+            cv2.circle(img, (28, 29), 6, dot_color, -1)
+            if is_pulse_on:
+                cv2.circle(img, (28, 29), 9, (0, 0, 255), 1)
+            txt = f"LIVE | {camera_name.upper()} | BAT: {bat_str} | {ts_str}"
+        else:
+            # Standby / Snapshot indicator: Solid amber dot (no deceptive blinking REC dot)
+            cv2.circle(img, (28, 29), 6, (0, 180, 245), -1)
+            lbl = status_label or "STANDBY (SNAPSHOT)"
+            txt = f"{lbl} | {camera_name.upper()} | BAT: {bat_str} | {ts_str}"
 
-        # Header text
-        txt = f"LIVE | {camera_name.upper()} | BAT: {bat_str} | {ts_str}"
-        cv2.putText(img, txt, (44, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (248, 250, 252), 1, cv2.LINE_AA)
+        cv2.putText(img, txt, (44, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (248, 250, 252), 1, cv2.LINE_AA)
 
         # Bottom status bar box
-        b_sub = img[h-35:h-10, 10:360]
-        b_rect = np.full(b_sub.shape, (10, 15, 26), dtype=np.uint8)
-        cv2.addWeighted(b_sub, 0.3, b_rect, 0.7, 0, b_sub)
-        cv2.putText(img, "AI DETECTOR: ARMED (GEMMA 4 E12B)", (20, h-17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (52, 211, 153), 1, cv2.LINE_AA)
+        if is_live:
+            b_sub = img[h-35:h-10, 10:360]
+            b_rect = np.full(b_sub.shape, (10, 15, 26), dtype=np.uint8)
+            cv2.addWeighted(b_sub, 0.3, b_rect, 0.7, 0, b_sub)
+            cv2.putText(img, "AI DETECTOR: ARMED (GEMMA 4 E12B)", (20, h-17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (52, 211, 153), 1, cv2.LINE_AA)
+        else:
+            b_w = min(w - 20, 520)
+            b_sub = img[h-35:h-10, 10:10+b_w]
+            b_rect = np.full(b_sub.shape, (20, 25, 35), dtype=np.uint8)
+            cv2.addWeighted(b_sub, 0.3, b_rect, 0.7, 0, b_sub)
+            if status_label and "RING" in status_label.upper():
+                footer_text = "RING CLOUD SNAPSHOT (PERIODIC REFRESH)"
+                footer_color = (200, 220, 240)
+            else:
+                footer_text = "OFFLINE SNAPSHOT - Open /mobile_cam on device to stream live"
+                footer_color = (0, 210, 255)
+            cv2.putText(img, footer_text, (20, h-17), cv2.FONT_HERSHEY_SIMPLEX, 0.42, footer_color, 1, cv2.LINE_AA)
 
         # Viewfinder corner ticks
         b_len = 24
-        b_col = (148, 163, 184)
+        b_col = (148, 163, 184) if is_live else (100, 130, 160)
         # Top-Left
         cv2.line(img, (14, 14), (14 + b_len, 14), b_col, 2)
         cv2.line(img, (14, 14), (14, 14 + b_len), b_col, 2)
@@ -685,9 +711,10 @@ def apply_live_cctv_hud(image_bytes: bytes, camera_name: str, battery_pct: Optio
 async def live_camera_stream(camera_name: str):
     """Serves continuous live MJPEG video stream with standard multipart framing for all cameras."""
     target_cam = ring_manager.find_camera(camera_name)
-    has_broadcaster = target_cam and hasattr(target_cam, "broadcaster") and target_cam.broadcaster is not None
+    is_tab = bool(target_cam and ("tab" in getattr(target_cam, "name", "").lower() or "a11" in getattr(target_cam, "name", "").lower()))
+    has_broadcaster = target_cam and hasattr(target_cam, "broadcaster") and target_cam.broadcaster is not None and not is_tab
 
-    # For cameras equipped with a live broadcaster (S21, Local Webcam): stream native smooth FPS
+    # For cameras equipped with a live broadcaster (S21, Local Webcam, Tab A11+): stream native smooth FPS
     if has_broadcaster:
         q = target_cam.broadcaster.subscribe()
         async def fast_broadcaster_stream():
@@ -695,21 +722,43 @@ async def live_camera_stream(camera_name: str):
                 real_cam_name = getattr(target_cam, "name", camera_name)
                 pic_fallback = target_cam.get_picture() if hasattr(target_cam, "get_picture") else None
                 first_frame = None
+                is_first_live = False
+
                 if getattr(target_cam, "_last_frame_bytes", None) and (time.time() - getattr(target_cam, "_last_frame_time", 0.0) < 6.0):
                     first_frame = target_cam._last_frame_bytes
+                    is_first_live = True
                 if not first_frame and hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
-                    first_frame = target_cam.broadcaster.latest_frame
+                    bf = target_cam.broadcaster.latest_frame
+                    if not is_blank_or_disabled_frame(bf):
+                        first_frame = bf
+                        is_first_live = True
                 if is_blank_or_disabled_frame(first_frame) and pic_fallback:
                     first_frame = pic_fallback
+                    is_first_live = False
                 if not first_frame and hasattr(target_cam, "async_get_snapshot"):
                     first_frame = await target_cam.async_get_snapshot()
+                    is_first_live = bool(first_frame and not is_blank_or_disabled_frame(first_frame))
                 if is_blank_or_disabled_frame(first_frame) and pic_fallback:
                     first_frame = pic_fallback
+                    is_first_live = False
                 if not first_frame:
                     first_frame = ring_manager.create_standby_frame(f"Connecting {real_cam_name}...", real_cam_name)
+                    is_first_live = False
 
                 bat = ring_manager.get_battery_level(target_cam) or 100
-                init_hud = apply_live_cctv_hud(first_frame, real_cam_name, bat)
+                pic_ts = getattr(target_cam, "picture_timestamp_str", None)
+                if not pic_ts and hasattr(target_cam, "picture_path") and target_cam.picture_path.exists():
+                    try:
+                        pic_ts = datetime.fromtimestamp(target_cam.picture_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
+
+                init_hud = apply_live_cctv_hud(
+                    first_frame, real_cam_name, bat,
+                    is_live=is_first_live,
+                    status_label="LIVE" if is_first_live else "STANDBY (SNAPSHOT)",
+                    timestamp_str=None if is_first_live else pic_ts
+                )
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
@@ -718,16 +767,18 @@ async def live_camera_stream(camera_name: str):
                     + b"\r\n"
                 )
                 
-                # Smooth broadcast loop capped at ~20-25 FPS (prevents socket reset & browser decode choke)
+                # Smooth broadcast loop capped at ~20-25 FPS when live, or 2 FPS in standby
                 last_sent = time.time()
                 while True:
                     # Check if camera has an active web stream (/mobile_cam within 6s)
                     last_web_t = getattr(target_cam, "_last_frame_time", 0.0)
                     is_web_fresh = (time.time() - last_web_t < 6.0) and (getattr(target_cam, "_last_frame_bytes", None) is not None)
 
+                    is_frame_live = False
                     if is_web_fresh:
                         frame = target_cam._last_frame_bytes
                         has_fresh_web = True
+                        is_frame_live = True
                         await asyncio.sleep(0.04)  # ~25 FPS pacing for mobile web stream
                     else:
                         has_fresh_web = False
@@ -736,22 +787,40 @@ async def live_camera_stream(camera_name: str):
                         except asyncio.TimeoutError:
                             frame = target_cam.broadcaster.latest_frame if (hasattr(target_cam, "broadcaster") and target_cam.broadcaster) else None
 
+                        if frame and not is_blank_or_disabled_frame(frame):
+                            is_frame_live = True
+
                     if not has_fresh_web and is_blank_or_disabled_frame(frame):
                         # Try DirectShow virtual camera if available (e.g. S21 / S22)
                         if hasattr(target_cam, "dshow_broadcaster") and target_cam.dshow_broadcaster and target_cam.dshow_broadcaster.latest_frame:
                             df = target_cam.dshow_broadcaster.latest_frame
                             if not is_blank_or_disabled_frame(df):
                                 frame = df
+                                is_frame_live = True
                         # Fallback to high-res picture
                         if is_blank_or_disabled_frame(frame) and pic_fallback:
                             frame = pic_fallback
+                            is_frame_live = False
                     if not frame:
                         frame = ring_manager.create_standby_frame(f"{real_cam_name} Reconnecting...", real_cam_name)
+                        is_frame_live = False
 
                     now = time.time()
-                    if frame and (now - last_sent >= 0.05):
+                    pacing_interval = 0.04 if is_frame_live else 0.5
+                    if frame and (now - last_sent >= pacing_interval):
                         last_sent = now
-                        live_hud = apply_live_cctv_hud(frame, real_cam_name, bat)
+                        pic_ts = getattr(target_cam, "picture_timestamp_str", None)
+                        if not pic_ts and hasattr(target_cam, "picture_path") and target_cam.picture_path.exists():
+                            try:
+                                pic_ts = datetime.fromtimestamp(target_cam.picture_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
+                        live_hud = apply_live_cctv_hud(
+                            frame, real_cam_name, bat,
+                            is_live=is_frame_live,
+                            status_label="LIVE" if is_frame_live else "STANDBY (SNAPSHOT)",
+                            timestamp_str=None if is_frame_live else pic_ts
+                        )
                         yield (
                             b"--frame\r\n"
                             b"Content-Type: image/jpeg\r\n"
@@ -797,6 +866,10 @@ async def live_camera_stream(camera_name: str):
         try:
             # 1. Immediately yield cached or standby frame so browser image switches with 0 latency
             init_frame = ring_manager._snapshot_cache.get(camera_name)
+            if not init_frame and hasattr(target_cam, "get_picture"):
+                init_frame = target_cam.get_picture()
+            if not init_frame and is_phone and hasattr(target_cam, "_last_frame_bytes"):
+                init_frame = getattr(target_cam, "_last_frame_bytes", None)
             if not init_frame and is_phone and hasattr(ring_manager, "_phone_cam"):
                 init_frame = ring_manager._phone_cam._last_frame_bytes
             if not init_frame:
@@ -804,16 +877,33 @@ async def live_camera_stream(camera_name: str):
             
             bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
             real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
-            init_hud = apply_live_cctv_hud(init_frame, real_cam_name, bat)
+            is_stream_live = is_phone and getattr(target_cam, "_last_frame_bytes", None) and (time.time() - getattr(target_cam, "_last_frame_time", 0.0) < 6.0)
+            
+            pic_ts = getattr(target_cam, "picture_timestamp_str", None) if target_cam else None
+            if not pic_ts and hasattr(target_cam, "picture_path") and target_cam.picture_path.exists():
+                try:
+                    pic_ts = datetime.fromtimestamp(target_cam.picture_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            init_hud = apply_live_cctv_hud(
+                init_frame, real_cam_name, bat,
+                is_live=bool(is_stream_live),
+                status_label="LIVE" if is_stream_live else ("RING SNAPSHOT" if not is_phone else "STANDBY (SNAPSHOT)"),
+                timestamp_str=None if is_stream_live else pic_ts
+            )
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + init_hud + b"\r\n")
 
             # Trigger immediate fresh snapshot fetch from Ring cloud
             asyncio.create_task(safe_bg_fetch(camera_name))
 
-            # 2. Continuous non-blocking real-time stream loop (10 FPS with live HUD)
+            # 2. Continuous non-blocking real-time stream loop
             last_bg_refresh = time.time()
             while True:
                 frame = ring_manager._snapshot_cache.get(camera_name)
+                if not frame and hasattr(target_cam, "get_picture"):
+                    frame = target_cam.get_picture()
+                if not frame and is_phone and hasattr(target_cam, "_last_frame_bytes"):
+                    frame = getattr(target_cam, "_last_frame_bytes", None)
                 if not frame and is_phone and hasattr(ring_manager, "_phone_cam"):
                     frame = ring_manager._phone_cam._last_frame_bytes
 
@@ -829,10 +919,23 @@ async def live_camera_stream(camera_name: str):
                 if frame:
                     bat = ring_manager.get_battery_level(target_cam) if target_cam else ring_manager.get_battery_level()
                     real_cam_name = getattr(target_cam, "name", camera_name) if target_cam else camera_name
-                    live_frame = apply_live_cctv_hud(frame, real_cam_name, bat)
+                    is_live_now = is_phone and getattr(target_cam, "_last_frame_bytes", None) and (now - getattr(target_cam, "_last_frame_time", 0.0) < 6.0)
+                    lbl = "LIVE" if is_live_now else ("RING SNAPSHOT" if not is_phone else "STANDBY (SNAPSHOT)")
+                    pic_ts = getattr(target_cam, "picture_timestamp_str", None) if target_cam else None
+                    if not pic_ts and hasattr(target_cam, "picture_path") and target_cam.picture_path.exists():
+                        try:
+                            pic_ts = datetime.fromtimestamp(target_cam.picture_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            pass
+                    live_frame = apply_live_cctv_hud(
+                        frame, real_cam_name, bat,
+                        is_live=bool(is_live_now),
+                        status_label=lbl,
+                        timestamp_str=None if is_live_now else pic_ts
+                    )
                     yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + live_frame + b"\r\n")
 
-                sleep_duration = 0.04 if is_phone else 0.1
+                sleep_duration = 0.04 if (is_phone and is_live_now) else 0.5
                 await asyncio.sleep(sleep_duration)
         except (asyncio.CancelledError, GeneratorExit, ConnectionResetError, BrokenPipeError):
             logger.debug(f"Client disconnected from stream for {camera_name}")

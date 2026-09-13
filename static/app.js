@@ -327,6 +327,7 @@ const savedCamera = rawSavedCamera.toLowerCase().includes("outhouse") ? "S21" : 
 let currentSelectedCamera = savedCamera;
 currentActiveCamera = savedCamera;
 let isRealtimeLiveActive = true;
+let cachedAllCameras = [];
 
 function isLiveStreamCurrentlyActive() {
   if (!isRealtimeLiveActive) return false;
@@ -422,6 +423,31 @@ async function selectActiveCamera(camName) {
   }
 }
 
+function updateActiveCameraStreamStatus() {
+  const cam = currentSelectedCamera || "Garden";
+  const camObj = (cachedAllCameras || []).find(c => {
+    if (!c || !c.name) return false;
+    const cn = c.name.toLowerCase();
+    const sn = cam.toLowerCase();
+    return cn === sn || (sn.includes("tab") && cn.includes("tab")) || (sn.includes("s21") && (cn.includes("s21") || cn.includes("phone")));
+  });
+
+  const isCamStreaming = camObj ? Boolean(camObj.is_streaming) : (cam !== "Galaxy Tab A11+");
+  const dotLive = document.getElementById("dotActiveCameraLive");
+
+  if (labelActiveCameraTimestamp) {
+    if (isCamStreaming) {
+      labelActiveCameraTimestamp.textContent = "Real-time Live 🔴";
+      labelActiveCameraTimestamp.className = "text-rose-400 font-semibold";
+      if (dotLive) dotLive.className = "w-2 h-2 rounded-full bg-rose-500 animate-pulse";
+    } else {
+      labelActiveCameraTimestamp.textContent = "Standby (Snapshot) 📸";
+      labelActiveCameraTimestamp.className = "text-amber-300 font-semibold";
+      if (dotLive) dotLive.className = "w-2 h-2 rounded-full bg-amber-400";
+    }
+  }
+}
+
 function updateActiveDevicePowerCard() {
   const card = document.getElementById("cardDevicePower");
   if (!card) return;
@@ -432,7 +458,7 @@ function updateActiveDevicePowerCard() {
   const typeEl = document.getElementById("activeDeviceCameraType");
   const iconEl = document.getElementById("activePowerIcon");
 
-  let pct = 50;
+  let pct = 80;
   let devName = currentSelectedCamera;
   let typeName = "Samsung Galaxy S21 Ultra";
 
@@ -445,13 +471,24 @@ function updateActiveDevicePowerCard() {
     devName = "cam1 Camera";
     typeName = "Ring Stick Up Cam (3rd Gen)";
   } else if (currentSelectedCamera === "Galaxy Tab A11+" || (currentSelectedCamera && currentSelectedCamera.toLowerCase().includes("tab"))) {
-    pct = 85;
+    pct = 80;
     devName = "Galaxy Tab A11+";
     typeName = "Samsung Galaxy Tab A11+ (IP Cam)";
   } else {
-    pct = 50;
+    pct = 80;
     devName = "Samsung S21 Ultra";
     typeName = "Samsung S21 Ultra (IP Cam)";
+  }
+
+  const camObj = (cachedAllCameras || []).find(c => {
+    if (!c || !c.name) return false;
+    const cn = c.name.toLowerCase();
+    const sn = (currentSelectedCamera || "").toLowerCase();
+    return cn === sn || (sn.includes("tab") && cn.includes("tab")) || (sn.includes("s21") && (cn.includes("s21") || cn.includes("phone")));
+  });
+
+  if (camObj && typeof camObj.battery_percentage === "number") {
+    pct = camObj.battery_percentage;
   }
 
   if (pctEl) pctEl.textContent = `${pct}%`;
@@ -484,9 +521,7 @@ function updateActiveCameraStream(forceReload = false) {
     if (forceReload || !mainCameraFeedImg.src || !mainCameraFeedImg.src.includes(targetPath)) {
       mainCameraFeedImg.src = `${targetPath}?t=${Date.now()}`;
     }
-    if (labelActiveCameraTimestamp) {
-      labelActiveCameraTimestamp.textContent = "Real-time Live 🔴";
-    }
+    updateActiveCameraStreamStatus();
   } else {
     // Ultra-reliable seamless snapshot polling fallback (600ms for S21/Tab, 2000ms for Ring)
     const pollInterval = (cam === "S21" || cam === "Galaxy Tab A11+" || (cam && cam.toLowerCase().includes("tab"))) ? 600 : 2000;
@@ -497,7 +532,8 @@ function updateActiveCameraStream(forceReload = false) {
         if (mainCameraFeedImg) {
           mainCameraFeedImg.src = snapImg.src;
           if (labelActiveCameraTimestamp) {
-            labelActiveCameraTimestamp.textContent = `${new Date().toLocaleTimeString()} (Live)`;
+            labelActiveCameraTimestamp.textContent = `${new Date().toLocaleTimeString()} (Snapshot)`;
+            labelActiveCameraTimestamp.className = "text-amber-300 font-semibold";
           }
         }
       };
@@ -616,6 +652,26 @@ async function fetchCameras() {
     const data = await res.json();
     const activeCam = (data.active_camera || "").toLowerCase();
     const cameras = data.cameras || [];
+    cachedAllCameras = cameras;
+
+    // Refresh UI streaming status indicator and battery card
+    updateActiveCameraStreamStatus();
+    updateActiveDevicePowerCard();
+
+    // Update Device Dropdown options with Live / Standby labels
+    if (selectActiveDevice) {
+      Array.from(selectActiveDevice.options).forEach(opt => {
+        const val = opt.value;
+        const camObj = cameras.find(c => c.name && (c.name.toLowerCase() === val.toLowerCase() || (val.toLowerCase().includes("tab") && c.name.toLowerCase().includes("tab")) || (val.toLowerCase().includes("s21") && (c.name.toLowerCase().includes("s21") || c.name.toLowerCase().includes("phone")))));
+        if (camObj) {
+          const isStream = Boolean(camObj.is_streaming);
+          const icon = val.includes("Tab") ? "📟" : val.includes("S21") ? "📱" : val.includes("Garden") ? "🌿" : "📹";
+          let baseTitle = camObj.name;
+          if (val === "S21") baseTitle = "Samsung S21 Ultra";
+          opt.textContent = `${icon} ${baseTitle} (${isStream ? "● Live" : "📸 Standby"})`;
+        }
+      });
+    }
 
     const isGardenActive = activeCam === "garden";
     const isCam1Active = activeCam === "cam1" || activeCam === "cam 1";
@@ -3913,19 +3969,14 @@ function getCameraStatusPillHtml(cam) {
           <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>LIVE
         </span>`;
   }
+  if (cam.uses_pictures || (cam.name && (cam.name.toLowerCase().includes("tab") || cam.name.toLowerCase().includes("a11")))) {
+    return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-amber-950/80 text-amber-300 border border-amber-700/60 flex items-center gap-1 whitespace-nowrap" title="Camera in standby / snapshot mode. Stream live via /mobile_cam on device.">
+      <span>📸</span> Standby
+    </span>`;
+  }
   if (cam.has_zone) {
     return `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 whitespace-nowrap shadow-sm">
-      <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
-    </span>`;
-  }
-  if (cam.name && (cam.name.toLowerCase().includes("tab") || cam.name.toLowerCase().includes("a11"))) {
-    return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-amber-950/80 text-amber-300 border border-amber-700/60 flex items-center gap-1 whitespace-nowrap" title="Tablet screen locked or asleep. Unlock tablet display to resume live video feed.">
-      <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>Standby
-    </span>`;
-  }
-  if (cam.uses_pictures) {
-    return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700 flex items-center gap-1 whitespace-nowrap">
-      <span>📸</span> Standby
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>Zone
     </span>`;
   }
   return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-emerald-950/80 text-emerald-300 border border-emerald-700/60 flex items-center gap-1 whitespace-nowrap">
@@ -3950,6 +4001,10 @@ function refreshFastLiveTiles() {
     const camName = vp.dataset.cam;
     if (!camName || seenCams.has(camName)) return;
     seenCams.add(camName);
+
+    // Skip high-frequency 250ms polling if camera is known to be in standby snapshot mode
+    const camObj = (cachedAllCameras || []).find(c => c.name && (c.name.toLowerCase() === camName.toLowerCase() || (camName.toLowerCase().includes("tab") && c.name.toLowerCase().includes("tab"))));
+    if (camObj && !camObj.is_streaming) return;
 
     if (tileInFlight[camName]) return;
 

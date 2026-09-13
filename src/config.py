@@ -13,21 +13,21 @@ class NodeSettings(BaseModel):
 
 class RingSettings(BaseModel):
     token_file: str = "ring_token.json"
-    device_name: Optional[str] = None
-    sample_interval_seconds: int = 60
+    device_name: Optional[str] = "Galaxy Tab A11+"
+    sample_interval_seconds: int = 5
     active_detection_interval_seconds: int = 2
     mock_if_unavailable: bool = True
-    phone_camera_url: Optional[str] = "http://192.168.1.165:8080/video"
+    phone_camera_url: Optional[str] = "http://127.0.0.1:8085/video"
 
 class InferenceSettings(BaseModel):
-    endpoint_url: str = "http://roland3:11434"
-    endpoint_type: Literal["ollama", "openai", "gemini"] = "ollama"
-    model_name: str = "tulkah_gemma4_12b:latest"
+    endpoint_url: str = "http://localhost:11434"
+    endpoint_type: Literal["ollama", "openai", "gemini"] = "gemini"
+    model_name: str = "gemini-3.7-flash"
     confidence_threshold: float = 0.75
     timeout_seconds: float = 45.0
     detection_polygon: Optional[list] = None
     camera_polygons: dict = Field(default_factory=dict)
-    target_object: str = "rat"
+    target_object: str = "bird"
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-3.7-flash"
 

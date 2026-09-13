@@ -451,6 +451,7 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
         self._cached_picture: Optional[bytes] = None
         self._last_frame_bytes: Optional[bytes] = None
         self._last_frame_time: float = 0.0
+        self.picture_timestamp_str: Optional[str] = None
 
     @property
     def battery_life(self) -> int:
@@ -466,8 +467,7 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
 
     def get_health(self) -> Dict[str, Any]:
         has_fresh_web = bool(self._last_frame_bytes and (time.time() - self._last_frame_time < 6.0))
-        has_dshow = bool(self.broadcaster and self.broadcaster.latest_frame and not is_blank_or_disabled_frame(self.broadcaster.latest_frame))
-        is_stream = has_fresh_web or has_dshow
+        is_stream = has_fresh_web
         return {
             "battery_percentage": self._battery_level,
             "battery_percentage_category": "good",
@@ -476,7 +476,7 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
             "device_id": self.device_id,
             "is_mock": False,
             "is_phone": True,
-            "is_local": True,
+            "is_local": False,
             "is_windows_link": True,
             "is_streaming": is_stream,
             "uses_pictures": not is_stream
@@ -499,6 +499,11 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
                     b = p.read_bytes()
                     if len(b) > 1000 and not is_blank_or_disabled_frame(b):
                         self._cached_picture = b
+                        if not self.picture_timestamp_str:
+                            try:
+                                self.picture_timestamp_str = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
                         return b
                 except Exception:
                     pass
@@ -510,6 +515,7 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
             self.picture_path.parent.mkdir(parents=True, exist_ok=True)
             self.picture_path.write_bytes(image_bytes)
             self._cached_picture = image_bytes
+            self.picture_timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return True
         except Exception as e:
             logger.error(f"Failed setting picture for {self.name}: {e}")
@@ -574,6 +580,7 @@ class AndroidPhoneCamera:
         self.wifi_candidates = wifi_candidates or ["http://192.168.1.165:8080/video"]
         self.picture_path = Path(picture_path or "data/s21_picture.jpg")
         self._cached_picture: Optional[bytes] = None
+        self.picture_timestamp_str: Optional[str] = None
         
         # Dynamically probe and select active working endpoint (USB/ADB or Wi-Fi)
         self.stream_url = self._resolve_active_stream_url(stream_url)
@@ -828,6 +835,11 @@ class AndroidPhoneCamera:
                     b = p.read_bytes()
                     if len(b) > 1000 and not is_blank_or_disabled_frame(b):
                         self._cached_picture = b
+                        if not self.picture_timestamp_str:
+                            try:
+                                self.picture_timestamp_str = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
                         return b
                 except Exception:
                     pass
@@ -839,6 +851,7 @@ class AndroidPhoneCamera:
             self.picture_path.parent.mkdir(parents=True, exist_ok=True)
             self.picture_path.write_bytes(image_bytes)
             self._cached_picture = image_bytes
+            self.picture_timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._last_frame_bytes = image_bytes
             self._last_frame_time = time.time()
             return True
@@ -1186,10 +1199,10 @@ class RingManager:
             is_streaming = False
             if is_tab:
                 has_fresh_web = bool(getattr(cam, "_last_frame_bytes", None) and (time.time() - getattr(cam, "_last_frame_time", 0.0) < 6.0))
-                has_dshow = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.latest_frame and not is_blank_or_disabled_frame(cam.broadcaster.latest_frame))
-                is_streaming = has_fresh_web or has_dshow
+                is_streaming = has_fresh_web
             elif is_local:
-                is_streaming = True
+                has_local = bool(hasattr(cam, "broadcaster") and cam.broadcaster and cam.broadcaster.latest_frame and not is_blank_or_disabled_frame(cam.broadcaster.latest_frame))
+                is_streaming = has_local
             elif is_phone:
                 has_fresh_web = bool(getattr(cam, "_last_frame_bytes", None) and (time.time() - getattr(cam, "_last_frame_time", 0.0) < 6.0))
                 has_dshow = bool(hasattr(cam, "dshow_broadcaster") and cam.dshow_broadcaster and cam.dshow_broadcaster.latest_frame and not is_blank_or_disabled_frame(cam.dshow_broadcaster.latest_frame))
@@ -1259,10 +1272,12 @@ class RingManager:
         cam = camera or self._active_camera
         if not cam:
             return None
+        if isinstance(cam, GalaxyTabWindowsCamera):
+            return getattr(cam, "battery_life", 80)
+        if isinstance(cam, AndroidPhoneCamera):
+            return getattr(cam, "battery_life", 80)
         if isinstance(cam, LocalRolandCamera):
             return 100
-        if isinstance(cam, AndroidPhoneCamera):
-            return getattr(cam, "battery_life", 50)
         try:
             bat = getattr(cam, "battery_life", None)
             if bat is not None:
@@ -1283,8 +1298,9 @@ class RingManager:
                 "is_mock": False
             }
 
-        is_local = isinstance(cam, LocalRolandCamera)
-        is_phone = isinstance(cam, AndroidPhoneCamera)
+        is_tab = isinstance(cam, GalaxyTabWindowsCamera) or "tab" in getattr(cam, "name", "").lower()
+        is_local = isinstance(cam, LocalRolandCamera) and not is_tab
+        is_phone = isinstance(cam, AndroidPhoneCamera) or is_tab
         is_ring = not is_local and not is_phone and not self._is_mock
         battery = self.get_battery_level(cam)
         wifi_rssi = getattr(cam, "wifi_signal_strength", None)
@@ -1456,6 +1472,7 @@ class RingManager:
             if isinstance(target_cam, (LocalRolandCamera, AndroidPhoneCamera)):
                 snap = await target_cam.async_get_snapshot()
                 if snap and not is_blank_or_disabled_frame(snap):
+                    is_new = (self._snapshot_cache.get(cam_name) != snap)
                     self._snapshot_cache[cam_name] = snap
                     if camera_name:
                         self._snapshot_cache[camera_name] = snap
@@ -1465,16 +1482,17 @@ class RingManager:
                         elif any(k in cam_name.lower() for k in ["tab", "a11"]):
                             self._snapshot_cache["Galaxy Tab A11+"] = snap
                             self._snapshot_cache["Tab A11+"] = snap
-                    return snap, None, False, True
+                    return snap, None, False, is_new
 
                 # If snap returned blank/disabled, attempt picture fallback
                 if hasattr(target_cam, "get_picture"):
                     pic = target_cam.get_picture()
                     if pic and not is_blank_or_disabled_frame(pic):
+                        is_new = (self._snapshot_cache.get(cam_name) != pic)
                         self._snapshot_cache[cam_name] = pic
                         if camera_name:
                             self._snapshot_cache[camera_name] = pic
-                        return pic, None, False, True
+                        return pic, None, False, is_new
 
                 return None, f"Could not open stream for {target_cam.name}", False, False
 
