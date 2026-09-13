@@ -489,9 +489,7 @@ class GalaxyTabWindowsCamera(LocalRolandCamera):
         candidates = [
             self.picture_path,
             Path("data/tab_a11_picture.jpg"),
-            Path("scratch/live_tab_check.jpg"),
-            Path("scratch/tab_test.jpg"),
-            Path("scratch/tab_crop_test.jpg"),
+            Path("scratch/live_stream_from_user.jpg"),
             Path("data/video_frames/frame_00s.jpg"),
             Path("data/current_feed_debug.jpg")
         ]

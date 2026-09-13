@@ -15,10 +15,10 @@
   <!-- Header -->
   <header class="flex items-center justify-between bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl backdrop-blur">
     <div class="flex items-center gap-2.5">
-      <span class="text-xl">📱</span>
+      <span class="text-xl" id="headerDeviceIcon">📱</span>
       <div>
-        <h1 class="text-sm font-bold text-white leading-none">Samsung S21 Ultra Cam</h1>
-        <p class="text-[11px] text-slate-400 mt-0.5" id="headerSubtitle">Streaming to Gemma 4 12B Vision</p>
+        <h1 class="text-sm font-bold text-white leading-none" id="headerDeviceTitle">Samsung S21 Ultra Cam</h1>
+        <p class="text-[11px] text-slate-400 mt-0.5" id="headerSubtitle">Streaming to Vision AI</p>
       </div>
     </div>
     
@@ -124,15 +124,53 @@
     const btnOverlayFlipCamera = document.getElementById("btnOverlayFlipCamera");
     const overlayFlipCameraLabel = document.getElementById("overlayFlipCameraLabel");
 
+    const headerDeviceIcon = document.getElementById("headerDeviceIcon");
+    const headerDeviceTitle = document.getElementById("headerDeviceTitle");
     const mobileDeviceSelect = document.getElementById("mobileDeviceSelect");
+
+    function updateDeviceHeaderUI(devName) {
+      const isTab = (devName || "").toLowerCase().includes("tab") || (devName || "").toLowerCase().includes("a11");
+      if (headerDeviceTitle) {
+        headerDeviceTitle.textContent = isTab ? "Galaxy Tab A11+ Cam" : "Samsung S21 Ultra Cam";
+      }
+      if (headerDeviceIcon) {
+        headerDeviceIcon.textContent = isTab ? "📟" : "📱";
+      }
+      document.title = isTab ? "RodentWatch AI — Galaxy Tab A11+ Live Cam" : "RodentWatch AI — S21 Ultra Live Cam";
+    }
+
     const urlParams = new URLSearchParams(window.location.search);
     const camParam = (urlParams.get("cam") || urlParams.get("device") || "").toLowerCase();
+    const savedDevice = localStorage.getItem("mobile_cam_device");
+
+    // Auto-detect tablet vs phone from User Agent & Screen dimensions
+    const ua = (navigator.userAgent || "").toLowerCase();
+    const isTabletUA = /sm-[tx]|tablet|nexus 7|nexus 9|nexus 10|sm-x/i.test(ua) ||
+                       (ua.includes("android") && !ua.includes("mobile")) ||
+                       (Math.min(window.screen.width, window.screen.height) >= 600 && ua.includes("android"));
+
     if (mobileDeviceSelect) {
       if (camParam.includes("tab") || camParam.includes("a11")) {
         mobileDeviceSelect.value = "Galaxy Tab A11+";
+        localStorage.setItem("mobile_cam_device", "Galaxy Tab A11+");
       } else if (camParam.includes("s21") || camParam.includes("phone")) {
         mobileDeviceSelect.value = "Samsung Galaxy S21 Ultra";
+        localStorage.setItem("mobile_cam_device", "Samsung Galaxy S21 Ultra");
+      } else if (savedDevice) {
+        mobileDeviceSelect.value = savedDevice;
+      } else if (isTabletUA) {
+        mobileDeviceSelect.value = "Galaxy Tab A11+";
+        localStorage.setItem("mobile_cam_device", "Galaxy Tab A11+");
+      } else {
+        mobileDeviceSelect.value = "Samsung Galaxy S21 Ultra";
       }
+
+      updateDeviceHeaderUI(mobileDeviceSelect.value);
+
+      mobileDeviceSelect.addEventListener("change", () => {
+        localStorage.setItem("mobile_cam_device", mobileDeviceSelect.value);
+        updateDeviceHeaderUI(mobileDeviceSelect.value);
+      });
     }
 
     let currentStream = null;

@@ -86,3 +86,37 @@ def test_api_simulate_all_targets():
         data = res.json()
         assert data["success"] is True
         assert data["detection"]["object_type"] in ["tree", "bird", "rodent", "rat", "horse", "horses_poo"]
+
+
+def test_tab_a11_stream_frame_routing():
+    import base64
+    from pathlib import Path
+    import numpy as np
+    import cv2
+    from src.app import ring_manager
+
+    pic_path = Path("data/tab_a11_picture.jpg")
+    orig_bytes = pic_path.read_bytes() if pic_path.exists() else None
+
+    try:
+        dummy = np.zeros((100, 100, 3), dtype=np.uint8)
+        dummy[20:80, 20:80] = (0, 255, 0)
+        _, enc = cv2.imencode(".jpg", dummy)
+        b64 = f"data:image/jpeg;base64,{base64.b64encode(enc.tobytes()).decode('utf-8')}"
+
+        res = client.post("/api/screen_cam/analyze", json={
+            "image_base64": b64,
+            "device_name": "Galaxy Tab A11+ (1.0x)",
+            "battery_percentage": 92
+        })
+        assert res.status_code == 200
+        data = res.json()
+        assert data["success"] is True
+        assert ring_manager._tab_cam.battery_life == 92
+        assert ring_manager._tab_cam._last_frame_bytes is not None
+    finally:
+        if orig_bytes:
+            pic_path.write_bytes(orig_bytes)
+            if hasattr(ring_manager, "_tab_cam") and ring_manager._tab_cam:
+                ring_manager._tab_cam._cached_picture = orig_bytes
+

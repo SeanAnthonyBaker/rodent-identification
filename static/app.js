@@ -782,10 +782,15 @@ window.setSurveillanceZoom = setSurveillanceZoom;
     });
   }
 
-  // Target Object Quick Switch
+  // Target Object Quick Switch (Top Header & Settings Modal)
   if (headerTargetSelect) {
     headerTargetSelect.addEventListener("change", () => {
       setTargetObject(headerTargetSelect.value);
+    });
+  }
+  if (settingTargetObject) {
+    settingTargetObject.addEventListener("change", () => {
+      setTargetObject(settingTargetObject.value);
     });
   }
 
@@ -1601,6 +1606,22 @@ function initWebSocket() {
           }
 
           renderRoiCanvas();
+
+          // Instantly sync the corresponding camera tile in the Multi-Camera Target Zone Console
+          const devName = (payload.device_name || "").toLowerCase();
+          const isTabFrame = devName.includes("tab") || devName.includes("a11");
+          document.querySelectorAll(".zone-console-card").forEach(card => {
+            const cName = (card.dataset.cam || "").toLowerCase();
+            const matches = isTabFrame ? (cName.includes("tab") || cName.includes("a11")) : (cName.includes("s21") || cName.includes("phone"));
+            if (matches) {
+              const cImg = card.querySelector(".zone-crop-img");
+              if (cImg) cImg.src = payload.image_base64;
+              const pillWrap = card.querySelector(".zone-status-pill-wrap");
+              if (pillWrap && !pillWrap.innerHTML.includes("LIVE")) {
+                pillWrap.innerHTML = `<span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-950/90 text-rose-300 border border-rose-500/70 flex items-center gap-1.5 whitespace-nowrap shadow-[0_0_8px_rgba(244,63,94,0.35)]"><span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>LIVE</span>`;
+              }
+            }
+          });
         }
         return;
       }
@@ -2089,7 +2110,7 @@ async function loadSettings() {
     }
     if (settingGeminiKey && data.gemini_api_key) settingGeminiKey.value = data.gemini_api_key;
 
-    setTargetObject("rat");
+    setTargetObject(data.target_object || "rat");
 
     if (settingNtfyTopic && data.ntfy_topic) {
       settingNtfyTopic.value = data.ntfy_topic;

@@ -965,6 +965,10 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
             logger.info(f"🔋 Updated Tab A11+ battery level from live stream telemetry: {payload.battery_percentage}%")
         ring_manager._snapshot_cache["Galaxy Tab A11+"] = image_bytes
         ring_manager._snapshot_cache["Tab A11+"] = image_bytes
+        target_device.set_picture(image_bytes)
+        if ring_manager._active_camera != ring_manager._tab_cam:
+            ring_manager._active_camera = ring_manager._tab_cam
+            logger.info("Auto-switched active camera to Galaxy Tab A11+ from live stream.")
     elif hasattr(ring_manager, "_phone_cam"):
         target_device = ring_manager._phone_cam
         target_device._last_frame_bytes = image_bytes
@@ -974,6 +978,8 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
             logger.info(f"🔋 Updated S21 battery level from live stream telemetry: {payload.battery_percentage}%")
         ring_manager._snapshot_cache["Samsung Galaxy S21 Ultra"] = image_bytes
         ring_manager._snapshot_cache["S21"] = image_bytes
+        if hasattr(target_device, "set_picture"):
+            target_device.set_picture(image_bytes)
         if ring_manager._active_camera != ring_manager._phone_cam:
             ring_manager._active_camera = ring_manager._phone_cam
             logger.info("Auto-switched active camera to Samsung Galaxy S21 Ultra from live stream.")
@@ -992,7 +998,7 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
         "data": {
             "image_base64": f"data:image/jpeg;base64,{b64_thumb}",
             "timestamp": now_dt_str,
-            "device_name": payload.device_name or "Samsung Galaxy S21 Ultra",
+            "device_name": payload.device_name or ("Galaxy Tab A11+" if is_tab else "Samsung Galaxy S21 Ultra"),
             "motion_pct": delta_pct,
             "zone_delta_pct": delta_pct,
             "has_material_delta": has_material_delta
