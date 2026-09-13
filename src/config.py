@@ -56,6 +56,11 @@ class AppConfig(BaseSettings):
     @classmethod
     def load(cls, config_path: str = "config.yaml") -> "AppConfig":
         path = Path(config_path)
+        if not path.exists() and not path.is_absolute():
+            candidate = Path(__file__).resolve().parent.parent / config_path
+            if candidate.exists():
+                path = candidate
+
         data = {}
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
