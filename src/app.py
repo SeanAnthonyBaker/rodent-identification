@@ -1300,9 +1300,9 @@ async def get_cameras_zone_summary():
         if target_cam:
             from src.ring_client import LocalRolandCamera, AndroidPhoneCamera, GalaxyTabWindowsCamera
             if isinstance(target_cam, GalaxyTabWindowsCamera):
-                f = getattr(target_cam, "_last_frame_bytes", None)
-                if not f and hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
-                    f = target_cam.broadcaster.latest_frame
+                f = target_cam.broadcaster.latest_frame if (hasattr(target_cam, "broadcaster") and target_cam.broadcaster) else None
+                if not f:
+                    f = getattr(target_cam, "_last_frame_bytes", None)
                 is_streaming = (f is not None and not is_blank_or_disabled_frame(f))
             elif isinstance(target_cam, LocalRolandCamera):
                 is_streaming = True
@@ -1654,10 +1654,9 @@ def run():
         }
         logger.info("Starting server with HTTPS / SSL enabled for mobile camera access.")
     uvicorn.run(
-        "src.app:app",
+        app,
         host=config.server.host,
         port=config.server.port,
-        reload=False,
         **ssl_kwargs
     )
 

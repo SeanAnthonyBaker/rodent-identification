@@ -3612,9 +3612,14 @@ function getCameraStatusPillHtml(cam) {
       <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>Zone
     </span>`;
   }
+  if (cam.name && (cam.name.toLowerCase().includes("tab") || cam.name.toLowerCase().includes("a11"))) {
+    return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-amber-950/80 text-amber-300 border border-amber-700/60 flex items-center gap-1 whitespace-nowrap" title="Tablet screen locked or asleep. Unlock tablet display to resume live video feed.">
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>Standby
+    </span>`;
+  }
   if (cam.uses_pictures) {
     return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700 flex items-center gap-1 whitespace-nowrap">
-      <span>📸</span> Standby Pic
+      <span>📸</span> Standby
     </span>`;
   }
   return `<span class="px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-emerald-950/80 text-emerald-300 border border-emerald-700/60 flex items-center gap-1 whitespace-nowrap">
