@@ -1295,6 +1295,21 @@ async def get_cameras_zone_summary():
         has_zone = poly is not None and len(poly) >= 3
         is_sel = (cam_name.lower() == (active_cam_name or "").lower())
         is_mobile = any(k in cam_name.lower() for k in ["s21", "tab", "galaxy", "phone", "tablet"])
+        target_cam = ring_manager.find_camera(cam_name)
+        is_streaming = False
+        if target_cam:
+            from src.ring_client import LocalRolandCamera, AndroidPhoneCamera, GalaxyTabWindowsCamera
+            if isinstance(target_cam, GalaxyTabWindowsCamera):
+                f = getattr(target_cam, "_last_frame_bytes", None)
+                if not f and hasattr(target_cam, "broadcaster") and target_cam.broadcaster:
+                    f = target_cam.broadcaster.latest_frame
+                is_streaming = (f is not None and not is_blank_or_disabled_frame(f))
+            elif isinstance(target_cam, LocalRolandCamera):
+                is_streaming = True
+            elif isinstance(target_cam, AndroidPhoneCamera):
+                last_t = getattr(target_cam, "_last_frame_time", 0.0)
+                is_streaming = (time.time() - last_t < 10.0)
+
         results.append({
             "name": cam_name,
             "has_zone": has_zone,
@@ -1303,7 +1318,8 @@ async def get_cameras_zone_summary():
             "picture_url": f"/api/camera/{cam_name}/picture",
             "is_active": is_sel,
             "is_online": True,
-            "uses_pictures": is_mobile or c.get("uses_pictures", False),
+            "is_streaming": is_streaming,
+            "uses_pictures": is_mobile,
             "battery_percentage": c.get("battery_percentage"),
             "delta_percent": 0.0
         })
