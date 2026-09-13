@@ -143,6 +143,73 @@ const liveFeedTargetDropdownContainer = document.getElementById("liveFeedTargetD
 let currentTargetObject = "all";
 let currentFilterObject = "all";
 
+// Multi-Object Tracking State
+let lastDetectedTargetBox = null;
+let lastDetectedTargetLabel = null;
+let lastDetectedTargetType = null;
+let lastDetectedTargetConf = null;
+let lastDetectedTargetTime = 0;
+
+// Active multi-tracks: Map of id -> { id, label, class_name, confidence, box, lastSeen }
+const activeTrackedObjects = new Map();
+// Historic trajectory trails: Map of id -> [{ x, y, time }]
+const trackedObjectTrails = new Map();
+
+const TARGET_BOX_EXPIRY_MS = 2500;
+let targetBoxExpiryTimer = null;
+
+function clearDetectedTarget(reason = "Scene clear") {
+  if (targetBoxExpiryTimer) {
+    clearTimeout(targetBoxExpiryTimer);
+    targetBoxExpiryTimer = null;
+  }
+  lastDetectedTargetBox = null;
+  lastDetectedTargetLabel = null;
+  lastDetectedTargetType = null;
+  lastDetectedTargetConf = null;
+  lastDetectedTargetTime = 0;
+  activeTrackedObjects.clear();
+  trackedObjectTrails.clear();
+
+  // Re-render canvas immediately to erase the box, corner brackets, and alert reticle
+  if (typeof renderRoiCanvas === "function") {
+    renderRoiCanvas();
+  }
+
+  // Reset surveillance HUD analysis badge
+  const hudAnalysis = document.getElementById("statusActiveCameraAnalysis");
+  if (hudAnalysis) {
+    const curT = currentTargetObject || "all";
+    const formattedTarget = (curT !== "all") 
+      ? (curT.charAt(0).toUpperCase() + curT.slice(1)).replace("_", " ") 
+      : "All Objects";
+    hudAnalysis.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Gemini Armed &bull; ${formattedTarget} Focus`;
+  }
+
+  // Reset header sampling badge if currently tracking
+  const sText = document.getElementById("samplingStatusText");
+  const lPulse = document.getElementById("livePulse");
+  const lDot = document.getElementById("liveDot");
+  if (sText) {
+    sText.textContent = "🟢 Watchdog Active (0% GPU)";
+    sText.className = "text-xs font-medium text-emerald-400";
+    if (lPulse) lPulse.className = "animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75";
+    if (lDot) lDot.className = "relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500";
+  }
+
+  const lStatus = document.getElementById("liveFrameAnalysisStatus");
+  if (lStatus) {
+    lStatus.textContent = `✅ ${reason}`;
+  }
+}
+
+function armTargetBoxExpiry() {
+  if (targetBoxExpiryTimer) clearTimeout(targetBoxExpiryTimer);
+  targetBoxExpiryTimer = setTimeout(() => {
+    clearDetectedTarget("Target moved on");
+  }, TARGET_BOX_EXPIRY_MS);
+}
+
 // Settings Modal
 const settingsModal = document.getElementById("settingsModal");
 const btnOpenSettings = document.getElementById("btnOpenSettings");
@@ -1657,6 +1724,10 @@ function initWebSocket() {
           currentTargetObject = t;
           if (headerTargetSelect) headerTargetSelect.value = t;
           if (settingTargetObject) settingTargetObject.value = t;
+          if (galleryObjectFilter) {
+            galleryObjectFilter.value = t;
+            currentFilterObject = t;
+          }
           const labels = {
             all: "🌐 All Objects",
             rat: "🐀 Rat",
@@ -1725,13 +1796,14 @@ function initWebSocket() {
         return;
       }
 
+      if (msg.type === "object_cleared") {
+        clearDetectedTarget("Target moved on — Scene clear");
+        return;
+      }
+
       if (msg.type === "rejected") {
         const payload = msg.data;
-        if (liveFrameAnalysisStatus) {
-          liveFrameAnalysisStatus.textContent = `⚪ Rejected: ${payload.reason || "Not a rat"} [Spark: ${payload.spark_ms}ms]`;
-        }
-        lastDetectedTargetBox = null;
-        renderRoiCanvas();
+        clearDetectedTarget(`Rejected: ${payload.reason || "Not a rat"}`);
         return;
       }
 
@@ -1741,10 +1813,60 @@ function initWebSocket() {
         if (payload.interval_seconds) {
           sampleInterval = payload.interval_seconds;
         }
-        // Only bound if candidate could be an animal
-        if (payload.object_boundary && payload.is_animal !== false) {
+
+        if (payload.cleared || payload.is_animal === false || (!payload.object_boundary && (!payload.tracked_objects || payload.tracked_objects.length === 0))) {
+          clearDetectedTarget("Target moved on");
+          return;
+        }
+
+        const now = Date.now();
+
+        // Multi-Object Tracking Array
+        if (Array.isArray(payload.tracked_objects) && payload.tracked_objects.length > 0 && payload.is_animal !== false) {
+          payload.tracked_objects.forEach(obj => {
+            const trackId = obj.id || 1;
+            const box = obj.box;
+            const cls = (obj.class_name || "animal").toLowerCase();
+            const meta = getObjectMeta(cls, obj.label);
+            const conf = obj.confidence || null;
+
+            activeTrackedObjects.set(trackId, {
+              id: trackId,
+              box: box,
+              label: obj.label || `${meta.label} #${trackId}`,
+              class_name: cls,
+              confidence: conf,
+              lastSeen: now
+            });
+
+            // Append trajectory trail point (normalized center 0.0 to 1.0)
+            if (box && box.length >= 4) {
+              const cx = (box[1] + box[3]) / 2000.0;
+              const cy = (box[0] + box[2]) / 2000.0;
+              if (!trackedObjectTrails.has(trackId)) {
+                trackedObjectTrails.set(trackId, []);
+              }
+              const trail = trackedObjectTrails.get(trackId);
+              trail.push({ x: cx, y: cy, time: now });
+              if (trail.length > 35) trail.shift();
+            }
+          });
+
+          // Set primary target box for backwards compatibility
+          if (payload.object_boundary) {
+            lastDetectedTargetBox = payload.object_boundary;
+            lastDetectedTargetTime = now;
+            const first = payload.tracked_objects[0];
+            lastDetectedTargetLabel = first.label;
+            lastDetectedTargetType = first.class_name;
+            lastDetectedTargetConf = first.confidence;
+            armTargetBoxExpiry();
+          }
+          renderRoiCanvas();
+        } else if (payload.object_boundary && payload.is_animal !== false) {
+          // Single-target fallback
           lastDetectedTargetBox = payload.object_boundary;
-          lastDetectedTargetTime = Date.now();
+          lastDetectedTargetTime = now;
           const curTarget = (currentTargetObject || "all").toLowerCase();
           const targetMatchesType = curTarget === "all" ||
             (lastDetectedTargetType && (lastDetectedTargetType.includes(curTarget) || curTarget.includes(lastDetectedTargetType)));
@@ -1754,18 +1876,47 @@ function initWebSocket() {
             lastDetectedTargetType = "candidate_animal";
             lastDetectedTargetConf = null;
           }
+          armTargetBoxExpiry();
           renderRoiCanvas();
-        } else if (!payload.object_boundary && (Date.now() - lastDetectedTargetTime > 1500)) {
-          lastDetectedTargetBox = null;
-          renderRoiCanvas();
+        } else {
+          clearDetectedTarget("Target moved on");
+          return;
         }
+
+        // Clean up stale tracks not seen for > TARGET_BOX_EXPIRY_MS
+        for (const [tid, trk] of activeTrackedObjects.entries()) {
+          if (now - trk.lastSeen > TARGET_BOX_EXPIRY_MS) {
+            activeTrackedObjects.delete(tid);
+            trackedObjectTrails.delete(tid);
+          }
+        }
+        if (activeTrackedObjects.size === 0 && (!lastDetectedTargetBox || (now - lastDetectedTargetTime > TARGET_BOX_EXPIRY_MS))) {
+          clearDetectedTarget("Target moved on");
+          return;
+        }
+
         if (liveFrameAnalysisStatus) {
-          liveFrameAnalysisStatus.textContent = payload.is_animal !== false
-            ? `⚡ Potential Animal in Zone — Real-Time Active (${payload.interval_seconds || 1}s)`
-            : `⚡ Zone Activity (${(payload.delta_percent || 0).toFixed(1)}% delta) — Real-Time Active (${payload.interval_seconds || 1}s)`;
+          const numTracks = activeTrackedObjects.size;
+          if (numTracks > 1) {
+            const first = activeTrackedObjects.values().next().value;
+            const speciesName = (first && first.class_name) ? first.class_name.toUpperCase() : "ANIMAL";
+            liveFrameAnalysisStatus.textContent = `⚡ MULTI-TRACKING: ${numTracks} ${speciesName}S ACTIVE IN ZONE (${payload.interval_seconds || 1}s)`;
+          } else if (numTracks === 1) {
+            const first = activeTrackedObjects.values().next().value;
+            liveFrameAnalysisStatus.textContent = `⚡ Tracking ${first.label} (${payload.interval_seconds || 1}s)`;
+          } else {
+            liveFrameAnalysisStatus.textContent = payload.is_animal !== false
+              ? `⚡ Potential Animal in Zone — Real-Time Active (${payload.interval_seconds || 1}s)`
+              : `⚡ Zone Activity (${(payload.delta_percent || 0).toFixed(1)}% delta) — Real-Time Active (${payload.interval_seconds || 1}s)`;
+          }
         }
         if (samplingStatusText) {
-          samplingStatusText.textContent = `⚡ Real-Time Active (${payload.interval_seconds || 1}s)`;
+          const numTracks = activeTrackedObjects.size;
+          if (numTracks > 1) {
+            samplingStatusText.textContent = `⚡ Multi-Tracking (${numTracks} Active)`;
+          } else {
+            samplingStatusText.textContent = `⚡ Real-Time Active (${payload.interval_seconds || 1}s)`;
+          }
           samplingStatusText.className = "text-xs font-bold text-amber-400 animate-pulse";
         }
         return;
@@ -1778,15 +1929,7 @@ function initWebSocket() {
           sampleInterval = payload.interval_seconds;
         }
         if (payload.sampling_cadence === "idle") {
-          lastDetectedTargetBox = null;
-          if (liveFrameAnalysisStatus) {
-            liveFrameAnalysisStatus.textContent = `Monitoring (Sampling every ${payload.interval_seconds}s)`;
-          }
-          if (samplingStatusText) {
-            samplingStatusText.textContent = `🟢 Watchdog Active (Sampling ${payload.interval_seconds}s)`;
-            samplingStatusText.className = "text-xs font-medium text-emerald-400";
-          }
-          renderRoiCanvas();
+          clearDetectedTarget(`Monitoring (Sampling every ${payload.interval_seconds}s)`);
         }
         return;
       }
@@ -1810,10 +1953,15 @@ function initWebSocket() {
           lastDetectedTargetLabel = tagLabel;
           lastDetectedTargetType = payload.object_type || "target";
           lastDetectedTargetConf = payload.confidence || 0.0;
+          armTargetBoxExpiry();
+
+          const hudAnalysis = document.getElementById("statusActiveCameraAnalysis");
+          if (hudAnalysis) {
+            hudAnalysis.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span> <span class="text-amber-400 font-bold">${tagEmoji} ${tagLabel} Identified (${Math.round(payload.confidence * 100)}%)</span>`;
+          }
         } else {
-          // Clear bounding box if not an animal
-          lastDetectedTargetBox = null;
-          renderRoiCanvas();
+          // Clear bounding box and reticle alert if scene is clear or not target
+          clearDetectedTarget(payload.cleared ? "Scene clear (No target confirmed)" : "Scene clear");
         }
 
         // Update header indicator badge
@@ -2850,20 +2998,52 @@ function renderRoiCanvas() {
     ctx.restore();
   }
 
-  // 3. Render Detected Target Bounding Box
-  if (lastDetectedTargetBox && (Date.now() - lastDetectedTargetTime < 15000)) {
-    renderDetectedTargetBoundingBox(ctx, w, h, lastDetectedTargetBox, lastDetectedTargetLabel, lastDetectedTargetType, lastDetectedTargetConf);
-  }
+  // 3. Render Multi-Object Tracked Targets or Single Primary Target
+  renderActiveTargets(ctx, w, h, TARGET_BOX_EXPIRY_MS);
 }
 window.cameraPolygons = cameraPolygons;
 window.renderRoiCanvas = renderRoiCanvas;
 window.updateRoiUiState = updateRoiUiState;
+window.clearDetectedTarget = clearDetectedTarget;
 window.setDetectedTarget = (box, label, type, conf) => {
   lastDetectedTargetBox = box;
   lastDetectedTargetTime = Date.now();
   lastDetectedTargetLabel = label;
   lastDetectedTargetType = type;
   lastDetectedTargetConf = conf;
+  armTargetBoxExpiry();
+  renderRoiCanvas();
+};
+window.setTrackedObjects = (trackedList) => {
+  const now = Date.now();
+  if (Array.isArray(trackedList)) {
+    trackedList.forEach(obj => {
+      const tid = obj.id || 1;
+      activeTrackedObjects.set(tid, {
+        id: tid,
+        box: obj.box,
+        label: obj.label || `Target #${tid}`,
+        class_name: obj.class_name || "animal",
+        confidence: obj.confidence || 0.9,
+        lastSeen: now
+      });
+      if (obj.box) {
+        const cx = (obj.box[1] + obj.box[3]) / 2000.0;
+        const cy = (obj.box[0] + obj.box[2]) / 2000.0;
+        if (!trackedObjectTrails.has(tid)) trackedObjectTrails.set(tid, []);
+        const tr = trackedObjectTrails.get(tid);
+        tr.push({ x: cx, y: cy, time: now });
+        if (tr.length > 35) tr.shift();
+      }
+    });
+    if (trackedList.length > 0) {
+      lastDetectedTargetBox = trackedList[0].box;
+      lastDetectedTargetTime = now;
+      lastDetectedTargetLabel = trackedList[0].label;
+      lastDetectedTargetType = trackedList[0].class_name;
+      lastDetectedTargetConf = trackedList[0].confidence;
+    }
+  }
   renderRoiCanvas();
 };
 
@@ -2934,11 +3114,6 @@ let prevMotionData = null;
 let lastMotionCheckTime = 0;
 let isGemmaAnalyzingScreen = false;
 let lastGemmaTriggerTime = 0;
-let lastDetectedTargetBox = null;
-let lastDetectedTargetTime = 0;
-let lastDetectedTargetLabel = "Rat";
-let lastDetectedTargetType = "rat";
-let lastDetectedTargetConf = 0.0;
 let lastDetectedRatBox = null;
 let lastDetectedRatTime = 0;
 
@@ -3268,10 +3443,8 @@ function screenCamLoop() {
       lastMotionCheckTime = now;
       checkScreenMotion(activeLiveVideo, cropX, cropY, cropW, cropH);
     }
-    // 5. Render Detected Target Bounding Box & Perimeter (if active in last 6 seconds)
-    if (lastDetectedTargetBox && (now - lastDetectedTargetTime < 6000)) {
-      renderDetectedTargetBoundingBox(ctx, w, h, lastDetectedTargetBox, lastDetectedTargetLabel, lastDetectedTargetType, lastDetectedTargetConf);
-    }
+    // 5. Render Detected Target Bounding Boxes & Trajectories (auto-cleared if expired)
+    renderActiveTargets(ctx, w, h, TARGET_BOX_EXPIRY_MS);
 
     // 4. Render Active Polygon Detection Zone Overlay on top of live video
     renderScreenZoneOverlay(ctx, w, h);
@@ -3424,7 +3597,7 @@ function drawTargetReticle(ctx, cx, cy, label, type, conf, strokeCol, tagEmoji, 
   ctx.restore();
 }
 
-function renderDetectedTargetBoundingBox(ctx, w, h, box, label, type, conf) {
+function renderDetectedTargetBoundingBox(ctx, w, h, box, label, type, conf, trackId = null) {
   if (!box || box.length < 4) return;
 
   // ONLY bound an object when it is a recognized target
@@ -3498,11 +3671,76 @@ function renderDetectedTargetBoundingBox(ctx, w, h, box, label, type, conf) {
     cy = ymin + reticleRadius + 6;
   }
 
-  const displayLabel = isTracking ? "Candidate Object" : meta.label;
-  const displayEmoji = isTracking ? "⚡" : meta.emoji;
+  const displayLabel = (label && trackId !== null) ? label : (isTracking ? "Candidate Object" : meta.label);
+  const displayEmoji = (trackId !== null && meta.emoji) ? meta.emoji : (isTracking ? "⚡" : meta.emoji);
   drawTargetReticle(ctx, cx, cy, displayLabel, type, conf, strokeColor, displayEmoji, ymin);
 
   ctx.restore();
+}
+
+function drawTrackTrajectoryTrail(ctx, w, h, trail, color) {
+  if (!trail || trail.length < 2) return;
+  ctx.save();
+  ctx.strokeStyle = color || "#38bdf8";
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  const pt0 = trail[0];
+  ctx.moveTo(pt0.x * w, pt0.y * h);
+  for (let i = 1; i < trail.length; i++) {
+    const pt = trail[i];
+    ctx.lineTo(pt.x * w, pt.y * h);
+  }
+  ctx.stroke();
+
+  // Draw fading historical dots along trajectory
+  for (let i = 0; i < trail.length; i++) {
+    const pt = trail[i];
+    const alpha = 0.25 + 0.75 * ((i + 1) / trail.length);
+    ctx.fillStyle = color || "#38bdf8";
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(pt.x * w, pt.y * h, i === trail.length - 1 ? 4 : 2.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function renderActiveTargets(ctx, w, h, maxAgeMs = TARGET_BOX_EXPIRY_MS) {
+  const now = Date.now();
+  let hasRenderedMulti = false;
+
+  // 1. Render all multi-tracked objects and their trajectory trails
+  if (activeTrackedObjects.size > 0) {
+    for (const [trackId, trk] of activeTrackedObjects.entries()) {
+      if (now - trk.lastSeen < maxAgeMs) {
+        hasRenderedMulti = true;
+        const trail = trackedObjectTrails.get(trackId);
+        const meta = getObjectMeta(trk.class_name, trk.label);
+        if (trail && trail.length > 1) {
+          drawTrackTrajectoryTrail(ctx, w, h, trail, meta.color);
+        }
+        renderDetectedTargetBoundingBox(
+          ctx, w, h, trk.box, trk.label, trk.class_name, trk.confidence, trackId
+        );
+      } else {
+        activeTrackedObjects.delete(trackId);
+        trackedObjectTrails.delete(trackId);
+      }
+    }
+  }
+
+  // 2. Fallback to single target box if no multi-tracks active
+  if (!hasRenderedMulti && lastDetectedTargetBox) {
+    if (now - lastDetectedTargetTime < maxAgeMs) {
+      renderDetectedTargetBoundingBox(
+        ctx, w, h, lastDetectedTargetBox, lastDetectedTargetLabel, lastDetectedTargetType, lastDetectedTargetConf
+      );
+    } else {
+      clearDetectedTarget("Target moved on");
+    }
+  }
 }
 
 function renderDetectedRatBoundingBox(ctx, w, h, box) {
@@ -3615,6 +3853,7 @@ async function triggerScreenCamAiAnalysis() {
       lastDetectedTargetLabel = tagLabel;
       lastDetectedTargetType = result.object_type || (isPheasant ? "pheasant" : "rat");
       lastDetectedTargetConf = result.confidence || 0.0;
+      armTargetBoxExpiry();
 
       if (liveFrameAnalysisStatus) {
         liveFrameAnalysisStatus.textContent = `${tagEmoji} ${tagLabel.toUpperCase()} DETECTED! (${Math.round(result.confidence * 100)}%)`;
@@ -3622,9 +3861,7 @@ async function triggerScreenCamAiAnalysis() {
       playAlertAudio();
       await fetchDetections();
     } else {
-      if (liveFrameAnalysisStatus) {
-        liveFrameAnalysisStatus.textContent = "✅ Scene clear (No target confirmed)";
-      }
+      clearDetectedTarget("Scene clear (No target confirmed)");
     }
   } catch (err) {
     console.error("Error during Screen Cam Gemma inference:", err);

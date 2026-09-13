@@ -4,7 +4,7 @@ import inspect
 import logging
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Tuple
 
 from src.ring_client import RingManager, LocalRolandCamera, MockRingCamera
 from src.inference_client import RolandInferenceClient, DetectionResult
@@ -44,6 +44,8 @@ class SamplerEngine:
         self._sample_count: int = 0
         self._last_battery_level: Optional[int] = None
         self._is_rat_active: bool = False
+        self._tracked_animal_active: bool = False
+        self._empty_animal_ticks: int = 0
         # Event Session Grouping State (records continuous sighting as a single event)
         self._active_event_id: Optional[str] = None
         self._active_event_object: Optional[str] = None
@@ -157,11 +159,13 @@ class SamplerEngine:
             # 1. Fast Detector: Eyes that never blink (finds candidate objects, draws boxes, extracts crops)
             fast_result = self.fast_detector.detect_boxes(
                 snapshot_bytes,
-                polygon=self.inference.detection_polygon
+                polygon=self.inference.detection_polygon,
+                target_object=self.inference.target_object
             )
             has_candidates = fast_result["has_candidates"]
             primary_box = fast_result["primary_box"]
             primary_crop = fast_result["primary_crop_bytes"]
+            tracked_objects = fast_result.get("tracked_objects", [])
 
             # 2. Zone delta check for motion activity
             zone_info = self.motion_pipeline.compute_zone_delta(
@@ -183,9 +187,10 @@ class SamplerEngine:
                 ref_bytes = snapshot_bytes
 
             # Crop sent to Gemma: tight bounding box crop from the fast detector or zone crop
-            crop_bytes = primary_crop or zone_info["focused_crop_bytes"]
-            crop_bbox = zone_info["crop_bbox"]
-            is_subcrop = primary_crop is not None or crop_bbox is not None
+            # Priority: focused high-contrast bounding box candidate > fallback zone crop
+            crop_bytes = primary_crop if primary_crop else zone_info["focused_crop_bytes"]
+            crop_bbox = primary_box if primary_box else zone_info.get("crop_bbox")
+            is_subcrop = True
 
             # --- STAGE 1: IMMEDIATE TRANSITION TO REAL-TIME & OBJECT BOUNDARY EMISSION ---
             if has_delta:
@@ -197,17 +202,48 @@ class SamplerEngine:
                 if was_idle:
                     logger.info(f"⚡ Activity in target zone ({delta_pct:.1f}% delta) -> Accelerating sampling to REAL-TIME ({self.active_detection_interval_seconds}s)")
 
-                # Notify clients: only send object_boundary when it could be an animal
+                # Determine status message
+                tgt_cap = (self.inference.target_object or "animal").capitalize()
+                num_t = len(tracked_objects)
+                status_msg = f"⚡ Activity in Zone ({delta_pct:.1f}% delta) — Real-Time Active"
+                if object_boundary:
+                    if num_t > 1:
+                        status_msg = f"⚡ {num_t} {tgt_cap}s Tracked in Zone — Real-Time"
+                    elif num_t == 1:
+                        status_msg = f"⚡ {tgt_cap} Tracked in Zone — Real-Time"
+                    else:
+                        status_msg = "⚡ Potential Animal in Zone"
+
+                # Notify clients: send object_boundary and full tracked_objects array
                 await self._notify_subscribers("object_detected", {
                     "device_name": self.ring.camera_name,
                     "timestamp": timestamp_str,
                     "object_boundary": object_boundary,
+                    "tracked_objects": tracked_objects,
                     "is_animal": has_animal_candidate,
                     "delta_percent": delta_pct,
                     "sampling_cadence": "realtime",
                     "interval_seconds": self.current_interval_seconds,
-                    "status_text": f"⚡ Activity in Zone ({delta_pct:.1f}% delta) — Real-Time Active" if not object_boundary else "⚡ Potential Animal in Zone"
+                    "status_text": status_msg
                 })
+
+            if has_animal_candidate:
+                self._tracked_animal_active = True
+                self._empty_animal_ticks = 0
+            elif self._tracked_animal_active:
+                self._empty_animal_ticks += 1
+                if self._empty_animal_ticks >= 2:
+                    self._tracked_animal_active = False
+                    self._empty_animal_ticks = 0
+                    self._is_rat_active = False
+                    await self._notify_subscribers("object_cleared", {
+                        "cleared": True,
+                        "device_name": self.ring.camera_name,
+                        "is_animal": False,
+                        "object_boundary": None,
+                        "tracked_objects": [],
+                        "status_text": "Target moved on — Scene clear"
+                    })
 
             # --- STAGE 2: BRING AI VISION ENGINE INTO PLAY (NON-BLOCKING ASYNC CASCADE) ---
             now_t = time.time()
@@ -316,8 +352,24 @@ class SamplerEngine:
             if current_target != "tree":
                 disallowed_types.add("tree")
 
+            # Enforce target matching when a specific target is set (not "all")
+            target_matches = True
+            if current_target not in ["all", ""]:
+                obj_low = inference_result.object_type.lower()
+                if current_target in ["horse", "horses", "pony", "equine"]:
+                    target_matches = obj_low in ["horse", "horses", "pony", "equine"]
+                elif current_target in ["bird", "birds", "pheasant"]:
+                    target_matches = obj_low in ["bird", "birds", "pheasant"]
+                elif current_target in ["rat", "rodent", "rats", "mouse"]:
+                    target_matches = obj_low in ["rodent", "rat", "mouse"]
+                elif current_target in ["horses_poo", "horse_poo", "horses poo", "poo", "manure", "dung"]:
+                    target_matches = obj_low in ["horses_poo", "horse_poo", "horses poo", "poo", "manure", "dung"]
+                elif current_target in ["tree", "trees"]:
+                    target_matches = obj_low in ["tree", "trees"]
+
             is_valid_animal = (
                 inference_result.is_detected
+                and target_matches
                 and inference_result.object_type.lower() not in disallowed_types
                 and (inference_result.confidence >= min_conf_threshold)
             )
@@ -327,6 +379,8 @@ class SamplerEngine:
                 inference_result.is_detected = False
                 inference_result.is_rat_detected = False
                 inference_result.bounding_box = None
+                self._is_rat_active = False
+                self._tracked_animal_active = False
             elif not inference_result.bounding_box and object_boundary:
                 inference_result.bounding_box = object_boundary
 
@@ -408,13 +462,14 @@ class SamplerEngine:
                 "battery_percentage": self._last_battery_level,
                 "detected": inference_result.is_detected,
                 "rat_detected": inference_result.is_detected,
-                "object_type": inference_result.object_type,
-                "label": inference_result.label,
+                "object_type": inference_result.object_type if inference_result.is_detected else "none",
+                "label": inference_result.label if inference_result.is_detected else "None",
                 "bounding_box": inference_result.bounding_box,
-                "is_boosted": self._is_rat_active,
+                "is_boosted": self._is_rat_active and inference_result.is_detected,
+                "cleared": not inference_result.is_detected,
                 "current_interval_seconds": self.current_interval_seconds,
                 "base_interval_seconds": self.base_interval_seconds,
-                "confidence": inference_result.confidence,
+                "confidence": inference_result.confidence if inference_result.is_detected else 0.0,
                 "description": inference_result.description,
                 "inference_time_ms": inference_result.inference_time_ms,
                 "detection_saved": detection_saved,
@@ -465,20 +520,33 @@ class SamplerEngine:
                         continue
 
                     # 2. Fast YOLO animal detector (~15ms)
-                    detector_res = self.fast_detector.detect_boxes(frame_bytes, polygon=poly)
+                    detector_res = self.fast_detector.detect_boxes(
+                        frame_bytes,
+                        polygon=poly,
+                        target_object=self.inference.target_object
+                    )
                     object_boundary = detector_res.get("primary_box")
+                    tracked_objects = detector_res.get("tracked_objects", [])
                     has_animal_candidate = detector_res.get("is_animal", False)
                     has_delta = has_material_delta or has_animal_candidate
 
                     if object_boundary and has_animal_candidate:
+                        self._tracked_animal_active = True
+                        self._empty_animal_ticks = 0
+                        num_tracked = len(tracked_objects)
+                        tgt_name = (self.inference.target_object or "animal").capitalize()
+                        plural = "s" if num_tracked > 1 else ""
+                        status_str = f"⚡ {num_tracked} {tgt_name}{plural} Tracked in Zone — Real-Time" if num_tracked > 0 else "⚡ Animal Tracked in Zone — Real-Time"
+
                         # Immediately emit real-time bounding box to browser WebSocket (< 1ms)
                         await self._notify_subscribers("object_detected", {
                             "object_boundary": object_boundary,
+                            "tracked_objects": tracked_objects,
                             "is_animal": True,
                             "delta_percent": delta_pct,
                             "sampling_cadence": "realtime",
                             "interval_seconds": 1,
-                            "status_text": "⚡ Animal Tracked in Zone — Real-Time"
+                            "status_text": status_str
                         })
 
                         # Enqueue high-res crop for Agent 3 (Determination Agent) if cooldown has passed
@@ -500,16 +568,32 @@ class SamplerEngine:
                                 "delta_pct": delta_pct,
                                 "health": self.ring.get_health_status()
                             })
-                    elif not has_delta and self._is_rat_active:
-                        now_ts = time.time()
-                        if (now_ts - self._active_event_last_seen) >= self.event_inactivity_timeout_seconds:
-                            self._is_rat_active = False
-                            self._active_event_id = None
-                            await self._notify_subscribers("cadence_changed", {
-                                "sampling_cadence": "idle",
-                                "interval_seconds": self.base_interval_seconds,
-                                "status_text": f"Monitoring (Sampling every {self.base_interval_seconds}s)"
-                            })
+                    else:
+                        if self._tracked_animal_active:
+                            self._empty_animal_ticks += 1
+                            if self._empty_animal_ticks >= 3:
+                                self._tracked_animal_active = False
+                                self._empty_animal_ticks = 0
+                                self._is_rat_active = False
+                                self._active_event_id = None
+                                await self._notify_subscribers("object_cleared", {
+                                    "cleared": True,
+                                    "is_animal": False,
+                                    "object_boundary": None,
+                                    "tracked_objects": [],
+                                    "device_name": self.ring.camera_name,
+                                    "status_text": "Target moved on — Scene clear"
+                                })
+                        elif not has_delta and self._is_rat_active:
+                            now_ts = time.time()
+                            if (now_ts - self._active_event_last_seen) >= self.event_inactivity_timeout_seconds:
+                                self._is_rat_active = False
+                                self._active_event_id = None
+                                await self._notify_subscribers("cadence_changed", {
+                                    "sampling_cadence": "idle",
+                                    "interval_seconds": self.base_interval_seconds,
+                                    "status_text": f"Monitoring (Sampling every {self.base_interval_seconds}s)"
+                                })
             except asyncio.CancelledError:
                 break
             except Exception as e:

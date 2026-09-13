@@ -236,6 +236,72 @@
       }).catch(() => {});
     }
 
+    // --- Two-Way Target Synchronization over WebSocket ---
+    const mobileTargetSelect = document.getElementById("mobileTargetSelect");
+    const motionAlertIcon = document.getElementById("motionAlertIcon");
+    const motionAlertText = document.getElementById("motionAlertText");
+    let isInternalTargetUpdate = false;
+    let mobileWs = null;
+
+    function setMobileTarget(target) {
+      if (!mobileTargetSelect || !target) return;
+      if (mobileTargetSelect.value !== target) {
+        isInternalTargetUpdate = true;
+        mobileTargetSelect.value = target;
+        isInternalTargetUpdate = false;
+      }
+    }
+
+    if (mobileTargetSelect) {
+      mobileTargetSelect.addEventListener("change", async () => {
+        if (isInternalTargetUpdate) return;
+        const target = mobileTargetSelect.value;
+        try {
+          await fetch("/api/target_object", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_object: target })
+          });
+        } catch (e) {
+          console.warn("Could not sync target to server:", e);
+        }
+      });
+    }
+
+    function initMobileWebSocket() {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${protocol}//${window.location.host}/ws/live`;
+      try {
+        mobileWs = new WebSocket(wsUrl);
+        mobileWs.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "target_object_changed" && msg.data && msg.data.target_object) {
+              setMobileTarget(msg.data.target_object);
+            } else if (msg.type === "connected" && msg.status && msg.status.target_object) {
+              setMobileTarget(msg.status.target_object);
+            }
+          } catch (e) {}
+        };
+        mobileWs.onclose = () => {
+          setTimeout(initMobileWebSocket, 3000);
+        };
+        mobileWs.onerror = () => {
+          mobileWs.close();
+        };
+      } catch (e) {
+        setTimeout(initMobileWebSocket, 3000);
+      }
+    }
+
+    // Fetch initial target on load & connect WebSocket
+    fetch("/api/settings").then(r => r.json()).then(data => {
+      if (data && data.target_object) {
+        setMobileTarget(data.target_object);
+      }
+    }).catch(() => {});
+    initMobileWebSocket();
+
     async function flipCamera() {
       currentFacingMode = (currentFacingMode === "environment") ? "user" : "environment";
       const isRear = (currentFacingMode === "environment");
@@ -350,32 +416,7 @@
         const canvas = document.createElement("canvas");
         const ctx = canvas.getContext("2d");
 
-    const mobileTargetSelect = document.getElementById("mobileTargetSelect");
-    const motionAlertIcon = document.getElementById("motionAlertIcon");
-    const motionAlertText = document.getElementById("motionAlertText");
-
-    // Fetch initial target
-    fetch("/api/settings").then(r => r.json()).then(data => {
-      if (data && data.target_object && mobileTargetSelect) {
-        mobileTargetSelect.value = data.target_object;
-      }
-    }).catch(() => {});
-
-    if (mobileTargetSelect) {
-      mobileTargetSelect.addEventListener("change", async () => {
-        try {
-          await fetch("/api/target_object", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ target_object: mobileTargetSelect.value })
-          });
-        } catch (e) {
-          console.warn("Could not sync target:", e);
-        }
-      });
-    }
-
-    let isUploading = false;
+        let isUploading = false;
     broadcastInterval = setInterval(async () => {
       if (!isBroadcasting || videoPreview.videoWidth === 0 || isUploading) return;
       isUploading = true;

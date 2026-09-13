@@ -67,16 +67,20 @@ def test_storage_multi_object_saving_and_filtering(tmp_path):
 
 
 def test_api_target_object_endpoints():
-    # Test setting target object
-    for target in ["tree", "bird", "rat", "horse", "horses_poo", "all"]:
-        res = client.post("/api/target_object", json={"target_object": target})
-        assert res.status_code == 200
-        assert res.json()["target_object"] == target
+    orig_target = client.get("/api/settings").json().get("target_object", "rat")
+    try:
+        # Test setting target object
+        for target in ["tree", "bird", "rat", "horse", "horses_poo", "all"]:
+            res = client.post("/api/target_object", json={"target_object": target})
+            assert res.status_code == 200
+            assert res.json()["target_object"] == target
 
-    # Test settings endpoint returns current target object
-    res = client.get("/api/settings")
-    assert res.status_code == 200
-    assert "target_object" in res.json()
+        # Test settings endpoint returns current target object
+        res = client.get("/api/settings")
+        assert res.status_code == 200
+        assert "target_object" in res.json()
+    finally:
+        client.post("/api/target_object", json={"target_object": orig_target})
 
 
 def test_api_simulate_all_targets():

@@ -63,7 +63,8 @@ inference_client = RolandInferenceClient(
     timeout_seconds=config.inference.timeout_seconds,
     detection_polygon=config.inference.detection_polygon,
     gemini_api_key=config.inference.gemini_api_key,
-    gemini_model=config.inference.gemini_model
+    gemini_model=config.inference.gemini_model,
+    target_object=config.inference.target_object
 )
 
 storage_manager = StorageManager(
@@ -929,6 +930,8 @@ async def refresh_camera_battery(camera_name: str = "S21"):
 _last_stream_ai_time = 0.0
 _is_analyzing_stream = False
 _prev_stream_gray = None
+_stream_animal_tracked = False
+_stream_empty_ticks = 0
 
 def detect_stream_motion(image_bytes: bytes) -> float:
     """Fast grayscale pixel difference for instant motion detection."""
@@ -1028,7 +1031,54 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
         }
     }))
 
-    # 4. Trigger AI: when material delta occurs inside target zone OR periodically every >= 8s to catch foraging/stationary wildlife
+    # 4. Fast animal detector for instant bounding boxes and clearance
+    fast_res = sampler_engine.fast_detector.detect_boxes(
+        image_bytes,
+        polygon=p,
+        target_object=inference_client.target_object
+    )
+    has_stream_animal = fast_res.get("is_animal", False)
+    stream_primary_box = fast_res.get("primary_box")
+    stream_tracked = fast_res.get("tracked_objects", [])
+
+    global _stream_animal_tracked, _stream_empty_ticks
+    if has_stream_animal and stream_primary_box:
+        _stream_animal_tracked = True
+        _stream_empty_ticks = 0
+        num_t = len(stream_tracked)
+        tgt_cap = (inference_client.target_object or "animal").capitalize()
+        status_msg = f"⚡ {num_t} {tgt_cap} Tracked in Zone" if num_t > 0 else "⚡ Animal Tracked in Zone"
+        asyncio.create_task(ws_broadcaster({
+            "type": "object_detected",
+            "data": {
+                "object_boundary": stream_primary_box,
+                "tracked_objects": stream_tracked,
+                "is_animal": True,
+                "device_name": cam_name,
+                "delta_percent": delta_pct,
+                "sampling_cadence": "realtime",
+                "interval_seconds": 1,
+                "status_text": status_msg
+            }
+        }))
+    elif _stream_animal_tracked:
+        _stream_empty_ticks += 1
+        if _stream_empty_ticks >= 3:
+            _stream_animal_tracked = False
+            _stream_empty_ticks = 0
+            asyncio.create_task(ws_broadcaster({
+                "type": "object_cleared",
+                "data": {
+                    "cleared": True,
+                    "is_animal": False,
+                    "object_boundary": None,
+                    "tracked_objects": [],
+                    "device_name": cam_name,
+                    "status_text": "Target moved on — Scene clear"
+                }
+            }))
+
+    # 5. Trigger AI: when material delta occurs inside target zone OR periodically every >= 8s to catch foraging/stationary wildlife
     global _last_stream_ai_time, _is_analyzing_stream
     time_since_stream_ai = now_time - _last_stream_ai_time
     should_run_ai = not _is_analyzing_stream and (has_material_delta or (time_since_stream_ai >= 8.0)) and (time_since_stream_ai >= 2.0)
@@ -1112,13 +1162,14 @@ async def analyze_screen_cam_frame(payload: ScreenCamFramePayload):
                         "battery_percentage": 50,
                         "detected": res.is_detected,
                         "rat_detected": res.is_detected,
-                        "object_type": res.object_type,
-                        "label": res.label,
-                        "bounding_box": res.bounding_box,
+                        "object_type": res.object_type if res.is_detected else "none",
+                        "label": res.label if res.is_detected else "None",
+                        "bounding_box": res.bounding_box if res.is_detected else None,
                         "is_boosted": res.is_detected,
+                        "cleared": not res.is_detected,
                         "current_interval_seconds": 5 if res.is_detected else 10,
                         "base_interval_seconds": 10,
-                        "confidence": res.confidence,
+                        "confidence": res.confidence if res.is_detected else 0.0,
                         "description": res.description,
                         "inference_time_ms": res.inference_time_ms,
                         "detection_saved": detection_saved,
